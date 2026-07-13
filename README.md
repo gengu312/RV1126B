@@ -1,0 +1,86 @@
+# RV1126B 入门实验仓库
+
+这是正点原子 `ATK-DLRV1126B` 开发板的学习记录。近期目标按导师要求调整为：
+
+```text
+连接并识别开发板 -> GPIO -> ADC -> 音频 -> 屏幕 -> 摄像头/NPU
+```
+
+你提到的“ATC 数据”当前暂按 **ADC（模数转换）数据** 理解；如果导师指的是其他模块，需要再修正。
+
+## 当前已确认状态（2026-07-13）
+
+- Windows 已识别 USB 设备 `2207:0006 rk3xxx`，ADB 在线。
+- 可直接执行 `adb shell`，进入后为开发板 `root` 用户。
+- 板卡自报 `Alientek RV1126B Board`，系统为 64 位 `Buildroot 2024.02`，内核为 `Linux 6.1.141`。
+- 当前 USB 连接只有 ADB，不会出现 COM 口；开发板网口和 Wi-Fi 当前也没有 IP。
+- GPIO 控制器和旧 sysfs GPIO 接口存在，但系统没有安装 `gpiodetect/gpioinfo/gpioget/gpioset`。
+- SAR ADC 已由 Linux IIO 驱动识别，可读取 8 个通道；当前驱动输出 `scale=0.219726562`。
+- 音频录放设备已识别，ALSA 卡为 `rockchip-es8390`。
+- MIPI DSI 屏幕已连接：`720x1280`、32 bpp、`/dev/fb0`。
+- 摄像头框架的设备节点存在，但启动日志显示 IMX335/IMX415/IMX586 传感器 ID 读取失败，暂不能据此认定摄像头已正常连接。
+
+完整证据见 [docs/bring-up-log.md](docs/bring-up-log.md)。
+
+## 现在先做什么
+
+### 1. 确认电脑还能看到开发板
+
+在本目录打开 PowerShell：
+
+```powershell
+adb devices
+adb shell
+```
+
+看到一行设备序列号并进入 `ATK-DLRV1126B` 的命令行，就说明连接正常。退出板端命令行使用 `exit`。
+
+### 2. 一键保存板卡信息
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\collect_board_info.ps1
+```
+
+报告会保存在 `output/board-info-时间.txt`，该目录已被 Git 忽略。
+
+### 3. 读取当前 ADC 数据
+
+```powershell
+adb push .\labs\02_adc\read_adc.sh /tmp/rv1126b-read-adc.sh
+adb shell sh /tmp/rv1126b-read-adc.sh
+```
+
+这一步只读取现有值，不需要外接电压。接线前必须先完成 [docs/pin-map.md](docs/pin-map.md)，确认物理针脚、量程和电平；**不要把 USB 的 5V 直接接到 ADC 或 GPIO**。
+
+### 4. GPIO 暂时只做识别，不做高低电平切换
+
+当前已确认 GPIO 控制器存在，但还没有从原理图核对“排针上的物理针脚”与“Linux GPIO 编号”的对应关系。先阅读 [labs/01_gpio/README.md](labs/01_gpio/README.md)，不要照搬其他 RV1126 开发板的编号。
+
+## 学习顺序和验收
+
+1. 连接：`adb shell` 每次都能稳定登录。
+2. 板卡信息：采集报告中能看到型号、系统、GPIO、IIO、ALSA、DRM 和摄像头状态。
+3. GPIO 输出：只使用已经从原理图确认的空闲引脚，完成 LED 亮灭。
+4. GPIO 输入：读取按键 0/1，并理解上拉、下拉和防抖。
+5. ADC：安全输入三个已知电平，原始值随电压单调变化。
+6. 组合：ADC 超过阈值时切换 GPIO，连续运行 10 分钟。
+7. 音频：录制 5 秒 WAV，确认不是全零或静音。
+8. 屏幕：先显示静态文字，再显示 ADC 和音量数值。
+
+各阶段记录入口：
+
+- [硬件清单](docs/hardware-inventory.md)
+- [引脚核对表](docs/pin-map.md)
+- [GPIO 实验](labs/01_gpio/README.md)
+- [ADC 实验](labs/02_adc/README.md)
+- [音频实验](labs/03_audio/README.md)
+- [屏幕实验](labs/04_display/README.md)
+- [官方资料入口](docs/resources.md)
+
+## 目前不要做
+
+- 不烧录固件、不改 U-Boot、内核和设备树。
+- 不直接套用老 RV1126 的 SDK、镜像、GPIO 编号或二进制库。
+- 不使用 `devmem` 直接改寄存器作为入门实验。
+- 不在未确认电平和量程前外接 5V 或未知模拟信号。
+- 不急着做 RKNN/NPU；先把 GPIO、ADC、音频、显示链路跑稳。

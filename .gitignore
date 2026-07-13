@@ -1,0 +1,15 @@
+# 本机采集结果和构建产物
+output/
+build/
+
+# 本机连接配置
+device.env
+
+# 大型厂商资料、镜像和模型不进入普通 Git 仓库
+vendor/
+*.img
+*.iso
+*.rknn
+*.tar
+*.tar.gz
+*.zip
