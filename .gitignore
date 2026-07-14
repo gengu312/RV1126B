@@ -6,6 +6,7 @@ build/
 device.env
 
 # 大型厂商资料、镜像和模型不进入普通 Git 仓库
+vendor-resources/
 vendor/
 *.img
 *.iso
