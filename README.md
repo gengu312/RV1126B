@@ -8,7 +8,7 @@
 
 你提到的“ATC 数据”当前暂按 **ADC（模数转换）数据** 理解；如果导师指的是其他模块，需要再修正。
 
-## 当前已确认状态（2026-07-13）
+## 当前已确认状态（2026-07-14）
 
 - Windows 已识别 USB 设备 `2207:0006 rk3xxx`，ADB 在线。
 - 可直接执行 `adb shell`，进入后为开发板 `root` 用户。
@@ -18,6 +18,7 @@
 - SAR ADC 已由 Linux IIO 驱动识别，可读取 8 个通道；当前驱动输出 `scale=0.219726562`。
 - 音频录放设备已识别，ALSA 卡为 `rockchip-es8390`。
 - MIPI DSI 屏幕已连接：`720x1280`、32 bpp、`/dev/fb0`。
+- 配套摄像头已确认是 `ATK-MCIMX415`；灰色 FFC 是备用主机接口，本板使用模组末端的 `2x11` 排针直插 MIPI CSI。
 - 摄像头框架的设备节点存在，但启动日志显示 IMX335/IMX415/IMX586 传感器 ID 读取失败，暂不能据此认定摄像头已正常连接。
 
 完整证据见 [docs/bring-up-log.md](docs/bring-up-log.md)。
@@ -52,9 +53,16 @@ adb shell sh /tmp/rv1126b-read-adc.sh
 
 这一步只读取现有值，不需要外接电压。接线前必须先完成 [docs/pin-map.md](docs/pin-map.md)，确认物理针脚、量程和电平；**不要把 USB 的 5V 直接接到 ADC 或 GPIO**。
 
-### 4. GPIO 暂时只做识别，不做高低电平切换
+### 4. 用板载工作灯完成第一个 GPIO 输出实验
 
-当前已确认 GPIO 控制器存在，但还没有从原理图核对“排针上的物理针脚”与“Linux GPIO 编号”的对应关系。先阅读 [labs/01_gpio/README.md](labs/01_gpio/README.md)，不要照搬其他 RV1126 开发板的编号。
+厂家引脚表和实机已确认板载工作灯由 `/sys/class/leds/work` 管理，不需要外接线：
+
+```powershell
+adb push .\labs\01_gpio\blink_work_led.sh /tmp/rv1126b-blink-led.sh
+adb shell sh /tmp/rv1126b-blink-led.sh
+```
+
+脚本会闪烁 3 次并恢复原来的 `heartbeat`。底板原理图现已到齐，但外部排针 GPIO 仍须先在 [docs/pin-map.md](docs/pin-map.md) 中核对物理针脚、复用和电平后再接线，具体说明见 [labs/01_gpio/README.md](labs/01_gpio/README.md)。
 
 ## 学习顺序和验收
 
@@ -75,7 +83,10 @@ adb shell sh /tmp/rv1126b-read-adc.sh
 - [ADC 实验](labs/02_adc/README.md)
 - [音频实验](labs/03_audio/README.md)
 - [屏幕实验](labs/04_display/README.md)
+- [摄像头安装与验收](labs/05_camera/README.md)
 - [官方资料入口](docs/resources.md)
+- [本地厂家资料盘点与磁盘策略](docs/vendor-materials.md)
+- [并行处理与无线并发初步测试](docs/parallel-processing-test.md)
 
 ## 目前不要做
 
@@ -84,3 +95,7 @@ adb shell sh /tmp/rv1126b-read-adc.sh
 - 不使用 `devmem` 直接改寄存器作为入门实验。
 - 不在未确认电平和量程前外接 5V 或未知模拟信号。
 - 不急着做 RKNN/NPU；先把 GPIO、ADC、音频、显示链路跑稳。
+
+## 厂家资料存放位置
+
+厂家资料存放在本项目的 `vendor-resources/alientek/` 目录，并被 Git 忽略。开发板 A 盘、开发板 B 盘和核心板 A 盘均已下载完整；B 盘的大型虚拟机和 SDK 暂时保持压缩状态，避免占满磁盘。目录、用途和缺口见 [docs/vendor-materials.md](docs/vendor-materials.md)。
