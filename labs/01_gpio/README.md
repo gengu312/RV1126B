@@ -29,7 +29,26 @@ cat /sys/kernel/debug/gpio
 ls -l /sys/class/gpio
 ```
 
-## GPIO 切换前的暂停点
+## 第一个安全输出实验：板载工作灯
+
+资料和实机已经交叉确认：
+
+```text
+板载工作/用户指示灯 -> WORK_PWM_LED -> GPIO0_C5 -> 全局 GPIO 21
+Linux 接口 -> /sys/class/leds/work
+默认触发器 -> heartbeat
+```
+
+该 GPIO 已由内核 LED 驱动接管，因此不要执行 `echo 21 > /sys/class/gpio/export`。使用驱动提供的 LED class 最安全：
+
+```powershell
+adb push .\labs\01_gpio\blink_work_led.sh /tmp/rv1126b-blink-led.sh
+adb shell sh /tmp/rv1126b-blink-led.sh
+```
+
+脚本闪烁 3 次后会恢复原来的 `heartbeat` 状态。它演示了“GPIO 最终控制物理电平”，同时保留 Linux 驱动的资源管理。
+
+## 外部 GPIO 切换前的暂停点
 
 先从整板资料中找到底板原理图和排针图，把候选针脚填入 `docs/pin-map.md`。至少确认：
 

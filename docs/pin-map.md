@@ -4,9 +4,9 @@
 
 | 用途 | 物理位置/针脚 | 原理图网络名 | Linux 控制器/编号 | 电平或量程 | 当前复用 | 证据页码 | 已实测 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 第一个 GPIO 输出 | TODO | TODO | TODO | TODO | TODO | TODO | 否 |
+| 第一个 GPIO 输出 | 板载工作/用户指示灯 | WORK_PWM_LED | GPIO0_C5；LED class `work` | 3.3 V 域 | 内核 LED 驱动，默认 heartbeat | 核心板引脚定义表 B 座 53；实机 debugfs | 是 |
 | 第一个 GPIO 输入 | TODO | TODO | TODO | TODO | TODO | TODO | 否 |
-| ADC 输入 | TODO | TODO | `iio:device0` 通道 TODO | TODO | TODO | TODO | 否 |
+| ADC 输入 | 板子右下角可调电位器 | SARADC0_IN4 | `iio:device0/in_voltage4_raw` | 正常输入 0～1.8 V | 专用 ADC，板载电位器 | 核心板引脚定义表 A 座 70；规格书第 14 页；实机 IIO | 是 |
 | GND | TODO | GND | 不适用 | 0 V | 不适用 | TODO | 否 |
 
 ## 操作前检查
@@ -17,3 +17,5 @@
 - [ ] GPIO 电平已确认，外部 LED 串有限流电阻。
 - [ ] ADC 最大输入电压已确认，输入信号与开发板共地。
 - [ ] 未把 5V、负电压或未知信号直接接入 GPIO/ADC。
+
+说明：板载工作灯已经由内核 LED 驱动占用，应该通过 `/sys/class/leds/work` 控制，不能再把全局 GPIO 21 导出到 `/sys/class/gpio` 抢占。
