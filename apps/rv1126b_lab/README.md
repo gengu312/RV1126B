@@ -9,11 +9,14 @@
 - 五点触摸：显示最多 5 个同时触点的编号、坐标、轨迹和前两点距离；
 - 系统监控：CPU、内存、根分区、温度、运行时间与设备状态；
 - 音频实验：触摸录音、实时音量与波形、WAV 保存和触摸回放；
+- 摄像头 / AI：检测 IMX415 的 V4L2 格式，并受控启动官方相机或 AiSpark YOLO；
 - 实验说明：直接在板上查看演示顺序。
 
 程序只在用户选择 LED 控制模式时接管板载工作灯；切回“只看数据”或退出程序时，会恢复进入前的触发器和亮度。
 
 音频录制使用板载 ES8390。开始录音前程序通过 `alsactl` 保存完整混音状态，只临时调整采集音量和 PGA，不启用 ADC 到扬声器直通；停止录音或退出时恢复原状态。录音保存在 `/userdata/rv1126b_lab/audio/`。
+
+官方相机和 AiSpark 本身是 Qt Quick 独立程序，并且都可能独占 `/dev/video-camera0`。实验台不复制厂商 GPLv3 源码，而是沿用厂商 SystemUI 的进程架构：检查设备后一次只启动一个子程序，子程序退出后回到实验台。
 
 ## 构建
 
@@ -46,9 +49,11 @@ powershell -ExecutionPolicy Bypass -File .\apps\rv1126b_lab\install.ps1
 - `RV1126BLAB_READ_ONLY=1`：禁止写入 LED；
 - `RV1126BLAB_AUTO_EXIT_MS=2000`：指定时间后自动退出。
 - `RV1126BLAB_SCREENSHOT=/tmp/home.png`：按 720×1280 离屏渲染并保存测试截图。
-- `RV1126BLAB_START_PAGE=1`：测试时直接打开指定页面（0～5）；
+- `RV1126BLAB_START_PAGE=1`：测试时直接打开指定页面（0～6）；
 - `RV1126BLAB_AUDIO_TEST_MS=1500`：自动完成一次指定时长的录音测试；
 - `RV1126BLAB_AUDIO_DIR=/tmp/audio-test`：测试时改写录音保存目录。
+- `RV1126BLAB_VISION_PROBE=1`：自动运行一次只读的 V4L2 格式检测；
+- `RV1126BLAB_VISION_LAUNCH_TEST=camera`：自动启动并关闭一次 `camera` 或 `aispark` 子程序。
 
 板端离屏测试示例：
 

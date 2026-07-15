@@ -308,8 +308,10 @@ public:
             QString::fromUtf8("CPU、内存、温度、设备"), 1, 0, 3);
         addModuleButton(grid, QString::fromUtf8("音频实验"),
             QString::fromUtf8("录音、波形、音量、回放"), 1, 1, 4);
+        addModuleButton(grid, QString::fromUtf8("摄像头 / AI"),
+            QString::fromUtf8("IMX415、NPU、YOLO"), 2, 0, 5);
         addModuleButton(grid, QString::fromUtf8("实验说明"),
-            QString::fromUtf8("当前阶段的演示与验收内容"), 2, 0, 5, 1, 2);
+            QString::fromUtf8("当前阶段的演示与验收内容"), 2, 1, 6);
         root->addLayout(grid, 1);
 
         auto *status = makePanel(this);
@@ -1159,6 +1161,265 @@ private:
     int m_recordSequence = 0;
 };
 
+class VisionPage final : public QWidget
+{
+public:
+    explicit VisionPage(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        setupUi();
+        refreshStatus();
+
+        m_external.setWorkingDirectory(QStringLiteral("/"));
+        m_external.setProcessChannelMode(QProcess::ForwardedChannels);
+        connect(&m_external, &QProcess::started, this, [this]() {
+            m_resultLabel->setText(QString::fromUtf8("已启动 %1；关闭子程序后会自动返回实验台。")
+                .arg(m_externalDisplayName));
+            setLaunchButtonsEnabled(false);
+            if (onExternalAppActive)
+                onExternalAppActive(true);
+        });
+        connect(&m_external,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this](int exitCode, QProcess::ExitStatus) {
+                setLaunchButtonsEnabled(true);
+                m_resultLabel->setText(QString::fromUtf8("%1 已退出（返回码 %2）。")
+                    .arg(m_externalDisplayName).arg(exitCode));
+                if (onExternalAppActive)
+                    onExternalAppActive(false);
+                refreshStatus();
+            });
+        connect(&m_external, &QProcess::errorOccurred, this,
+            [this](QProcess::ProcessError error) {
+                if (error == QProcess::FailedToStart) {
+                    setLaunchButtonsEnabled(true);
+                    m_resultLabel->setText(QString::fromUtf8("启动失败：%1")
+                        .arg(m_external.errorString()));
+                }
+            });
+
+        connect(&m_probe,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this](int exitCode, QProcess::ExitStatus) {
+                const QString output = QString::fromUtf8(m_probe.readAllStandardOutput()).trimmed();
+                const QString error = QString::fromUtf8(m_probe.readAllStandardError()).trimmed();
+                m_probeButton->setEnabled(true);
+                if (exitCode == 0 && !output.isEmpty()) {
+                    m_resultLabel->setText(QString::fromUtf8("摄像头格式检测：\n%1")
+                        .arg(output));
+                } else {
+                    m_resultLabel->setText(QString::fromUtf8("格式检测失败：%1")
+                        .arg(error.isEmpty() ? QString::fromUtf8("未知错误") : error));
+                }
+            });
+        connect(&m_probe, &QProcess::errorOccurred, this,
+            [this](QProcess::ProcessError error) {
+                if (error == QProcess::FailedToStart) {
+                    m_probeButton->setEnabled(true);
+                    m_resultLabel->setText(QString::fromUtf8("无法启动 v4l2-ctl。"));
+                }
+            });
+    }
+
+    std::function<void(bool)> onExternalAppActive;
+
+    void runAutomatedProbe()
+    {
+        probeCamera();
+    }
+
+    void runAutomatedLaunch(const QString &binaryName, int durationMs)
+    {
+        const QString displayName = binaryName == QStringLiteral("aispark")
+            ? QString::fromUtf8("AiSpark") : QString::fromUtf8("官方相机");
+        launchExternal(binaryName, displayName);
+        QTimer::singleShot(qBound(1000, durationMs, 5000), this, [this]() {
+            if (m_external.state() != QProcess::NotRunning) {
+                m_external.terminate();
+                QTimer::singleShot(700, this, [this]() {
+                    if (m_external.state() != QProcess::NotRunning)
+                        m_external.kill();
+                });
+            }
+        });
+    }
+
+private:
+    void setupUi()
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 18, 28, 24);
+        root->setSpacing(16);
+
+        auto *cameraPanel = makePanel(this);
+        auto *cameraLayout = new QVBoxLayout(cameraPanel);
+        cameraLayout->setContentsMargins(22, 18, 22, 18);
+        cameraLayout->setSpacing(12);
+        cameraLayout->addWidget(makeSectionTitle(QString::fromUtf8("IMX415 摄像头"), cameraPanel));
+        m_cameraStatus = new QLabel(cameraPanel);
+        m_cameraStatus->setObjectName(QStringLiteral("statusText"));
+        m_cameraStatus->setWordWrap(true);
+        m_cameraStatus->setMinimumWidth(0);
+        m_cameraStatus->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        cameraLayout->addWidget(m_cameraStatus);
+        auto *cameraButtons = new QHBoxLayout;
+        m_probeButton = new QPushButton(QString::fromUtf8("检测当前格式"), cameraPanel);
+        m_probeButton->setObjectName(QStringLiteral("actionButton"));
+        m_cameraButton = new QPushButton(QString::fromUtf8("打开官方相机"), cameraPanel);
+        m_cameraButton->setObjectName(QStringLiteral("actionButton"));
+        connect(m_probeButton, &QPushButton::clicked, this, [this]() { probeCamera(); });
+        connect(m_cameraButton, &QPushButton::clicked, this, [this]() {
+            launchExternal(QStringLiteral("camera"), QString::fromUtf8("官方相机"));
+        });
+        cameraButtons->addWidget(m_probeButton);
+        cameraButtons->addWidget(m_cameraButton);
+        cameraLayout->addLayout(cameraButtons);
+        root->addWidget(cameraPanel);
+
+        auto *aiPanel = makePanel(this);
+        auto *aiLayout = new QVBoxLayout(aiPanel);
+        aiLayout->setContentsMargins(22, 18, 22, 18);
+        aiLayout->setSpacing(12);
+        aiLayout->addWidget(makeSectionTitle(QString::fromUtf8("NPU / RKNN 智能识别"), aiPanel));
+        m_aiStatus = new QLabel(aiPanel);
+        m_aiStatus->setObjectName(QStringLiteral("statusText"));
+        m_aiStatus->setWordWrap(true);
+        m_aiStatus->setMinimumWidth(0);
+        m_aiStatus->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        aiLayout->addWidget(m_aiStatus);
+        m_aiButton = new QPushButton(QString::fromUtf8("打开 AiSpark（YOLO）"), aiPanel);
+        m_aiButton->setObjectName(QStringLiteral("actionButton"));
+        connect(m_aiButton, &QPushButton::clicked, this, [this]() {
+            launchExternal(QStringLiteral("aispark"), QString::fromUtf8("AiSpark"));
+        });
+        aiLayout->addWidget(m_aiButton);
+        root->addWidget(aiPanel);
+
+        auto *resultPanel = makePanel(this);
+        auto *resultLayout = new QVBoxLayout(resultPanel);
+        resultLayout->setContentsMargins(22, 16, 22, 16);
+        resultLayout->addWidget(makeSectionTitle(QString::fromUtf8("检测与启动结果"), resultPanel));
+        m_resultLabel = new QLabel(QString::fromUtf8(
+            "相机和 AI 会以独立子程序运行；实验台负责检查设备并避免重复启动。"), resultPanel);
+        m_resultLabel->setObjectName(QStringLiteral("statusText"));
+        m_resultLabel->setWordWrap(true);
+        m_resultLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        m_resultLabel->setMinimumHeight(170);
+        m_resultLabel->setMinimumWidth(0);
+        m_resultLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+        resultLayout->addWidget(m_resultLabel);
+        root->addWidget(resultPanel, 1);
+
+        auto *note = new QLabel(QString::fromUtf8(
+            "摄像头和 NPU 推理会争用同一路 /dev/video-camera0，因此一次只运行一个。"), this);
+        note->setObjectName(QStringLiteral("notice"));
+        note->setAlignment(Qt::AlignCenter);
+        note->setWordWrap(true);
+        root->addWidget(note);
+    }
+
+    void refreshStatus()
+    {
+        const QString cameraPath = QStringLiteral("/dev/video-camera0");
+        const QFileInfo camera(cameraPath);
+        QString node = camera.symLinkTarget();
+        if (node.isEmpty() && camera.exists())
+            node = cameraPath;
+        QString driverName;
+        if (!node.isEmpty()) {
+            driverName = oneLine(QString::fromUtf8("/sys/class/video4linux/%1/name")
+                .arg(QFileInfo(node).fileName()), QString());
+        }
+        m_cameraStatus->setText(camera.exists()
+                ? QString::fromUtf8("已识别：%1 → %2\n驱动节点：%3")
+                    .arg(cameraPath, node, driverName.isEmpty() ? QString::fromUtf8("可用") : driverName)
+                : QString::fromUtf8("未识别 /dev/video-camera0，请检查摄像头连接。"));
+
+        const bool npuReady = QFile::exists(QStringLiteral("/dev/rknpu"));
+        const bool runtimeReady = QFile::exists(QStringLiteral("/usr/lib/librknnrt.so"));
+        const bool aiReady = QFile::exists(QStringLiteral("/opt/ui/src/apps/aispark"));
+        m_aiStatus->setText(QString::fromUtf8("NPU 设备：%1    RKNN Runtime：%2\nAiSpark 与 YOLO 示例：%3")
+            .arg(npuReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
+            .arg(runtimeReady ? QString::fromUtf8("已安装") : QString::fromUtf8("未安装"))
+            .arg(aiReady ? QString::fromUtf8("可启动") : QString::fromUtf8("缺失")));
+        m_probeButton->setEnabled(camera.exists() && m_probe.state() == QProcess::NotRunning);
+        m_cameraButton->setEnabled(camera.exists()
+            && QFile::exists(QStringLiteral("/opt/ui/src/apps/camera")));
+        m_aiButton->setEnabled(npuReady && runtimeReady && aiReady);
+    }
+
+    bool processNamed(const QString &name) const
+    {
+        const QStringList entries = QDir(QStringLiteral("/proc"))
+            .entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString &entry : entries) {
+            bool numeric = false;
+            entry.toInt(&numeric);
+            if (!numeric)
+                continue;
+            if (oneLine(QString::fromUtf8("/proc/%1/comm").arg(entry), QString()) == name)
+                return true;
+        }
+        return false;
+    }
+
+    void launchExternal(const QString &binaryName, const QString &displayName)
+    {
+        if (m_external.state() != QProcess::NotRunning) {
+            m_resultLabel->setText(QString::fromUtf8("请先关闭当前运行的 %1。")
+                .arg(m_externalDisplayName));
+            return;
+        }
+        if (processNamed(QStringLiteral("camera")) || processNamed(QStringLiteral("aispark"))) {
+            m_resultLabel->setText(QString::fromUtf8(
+                "检测到相机或 AiSpark 已在运行，请先从桌面关闭它，再回来启动。"));
+            return;
+        }
+
+        const QString path = QString::fromUtf8("/opt/ui/src/apps/%1").arg(binaryName);
+        if (!QFileInfo(path).isExecutable()) {
+            m_resultLabel->setText(QString::fromUtf8("找不到可执行程序：%1").arg(path));
+            return;
+        }
+        m_externalDisplayName = displayName;
+        m_resultLabel->setText(QString::fromUtf8("正在启动 %1……").arg(displayName));
+        m_external.start(path, QStringList());
+    }
+
+    void probeCamera()
+    {
+        if (m_probe.state() != QProcess::NotRunning)
+            return;
+        if (processNamed(QStringLiteral("camera")) || processNamed(QStringLiteral("aispark"))) {
+            m_resultLabel->setText(QString::fromUtf8("摄像头正在被其他程序使用，暂不检测。"));
+            return;
+        }
+        m_probeButton->setEnabled(false);
+        m_resultLabel->setText(QString::fromUtf8("正在读取 V4L2 格式……"));
+        m_probe.start(QStringLiteral("/usr/bin/v4l2-ctl"), {
+            QStringLiteral("-d"), QStringLiteral("/dev/video-camera0"),
+            QStringLiteral("--get-fmt-video")
+        });
+    }
+
+    void setLaunchButtonsEnabled(bool enabled)
+    {
+        m_cameraButton->setEnabled(enabled);
+        m_aiButton->setEnabled(enabled);
+        m_probeButton->setEnabled(enabled);
+    }
+
+    QLabel *m_cameraStatus = nullptr;
+    QLabel *m_aiStatus = nullptr;
+    QLabel *m_resultLabel = nullptr;
+    QPushButton *m_probeButton = nullptr;
+    QPushButton *m_cameraButton = nullptr;
+    QPushButton *m_aiButton = nullptr;
+    QProcess m_external;
+    QProcess m_probe;
+    QString m_externalDisplayName;
+};
+
 class TouchCanvas final : public QWidget
 {
 public:
@@ -1489,7 +1750,7 @@ public:
         root->setContentsMargins(32, 24, 32, 30);
         root->setSpacing(18);
 
-        root->addWidget(makeSectionTitle(QString::fromUtf8("第一阶段怎么向导师演示"), this));
+        root->addWidget(makeSectionTitle(QString::fromUtf8("实验台怎么向导师演示"), this));
         auto *content = makePanel(this);
         auto *layout = new QVBoxLayout(content);
         layout->setContentsMargins(24, 20, 24, 20);
@@ -1500,7 +1761,8 @@ public:
             "拖动阈值并演示 LED 联动，再切换 ADC 调速闪烁。\n\n"
             "3. 五点触摸页：先单指画轨迹，再逐步增加到五指，展示独立编号、坐标和距离。\n\n"
             "4. 音频页：录制一段语音，观察音量和波形，停止后触摸回放。\n\n"
-            "5. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
+            "5. 摄像头 / AI 页：读取 IMX415 格式，分别启动官方相机和 AiSpark 演示。\n\n"
+            "6. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
         steps->setObjectName(QStringLiteral("helpText"));
         steps->setWordWrap(true);
         layout->addWidget(steps);
@@ -1540,6 +1802,18 @@ public:
     {
         showPage(4);
         m_audioPage->runAutomatedTest(durationMs);
+    }
+
+    void runVisionProbeTest()
+    {
+        showPage(5);
+        m_visionPage->runAutomatedProbe();
+    }
+
+    void runVisionLaunchTest(const QString &binaryName, int durationMs)
+    {
+        showPage(5);
+        m_visionPage->runAutomatedLaunch(binaryName, durationMs);
     }
 
 protected:
@@ -1593,17 +1867,29 @@ private:
         m_touchPage = new TouchPage(m_stack);
         m_systemPage = new SystemPage(m_stack);
         m_audioPage = new AudioPage(m_stack);
+        m_visionPage = new VisionPage(m_stack);
         m_helpPage = new HelpPage(m_stack);
         m_stack->addWidget(m_homePage);
         m_stack->addWidget(m_ioPage);
         m_stack->addWidget(m_touchPage);
         m_stack->addWidget(m_systemPage);
         m_stack->addWidget(m_audioPage);
+        m_stack->addWidget(m_visionPage);
         m_stack->addWidget(m_helpPage);
         root->addWidget(m_stack, 1);
 
         m_homePage->onNavigate = [this](int page) { showPage(page); };
         m_ioPage->onAdcChanged = [this](int raw) { m_homePage->updateAdc(raw); };
+        m_visionPage->onExternalAppActive = [this](bool active) {
+            if (active) {
+                hide();
+            } else {
+                showFullScreen();
+                showPage(5);
+                raise();
+                activateWindow();
+            }
+        };
         showPage(0);
     }
 
@@ -1619,6 +1905,7 @@ private:
             QString::fromUtf8("五点触摸实验"),
             QString::fromUtf8("系统监控"),
             QString::fromUtf8("音频采集与波形"),
+            QString::fromUtf8("摄像头与 AI"),
             QString::fromUtf8("实验说明")
         };
         m_stack->setCurrentIndex(index);
@@ -1804,6 +2091,7 @@ private:
     TouchPage *m_touchPage = nullptr;
     SystemPage *m_systemPage = nullptr;
     AudioPage *m_audioPage = nullptr;
+    VisionPage *m_visionPage = nullptr;
     HelpPage *m_helpPage = nullptr;
     QPushButton *m_backButton = nullptr;
     QPushButton *m_exitButton = nullptr;
@@ -1845,6 +2133,23 @@ int main(int argc, char *argv[])
     if (audioTestOk && audioTestMs > 0) {
         QTimer::singleShot(100, &window, [&window, audioTestMs]() {
             window.runAudioTest(audioTestMs);
+        });
+    }
+    if (qEnvironmentVariableIsSet("RV1126BLAB_VISION_PROBE")) {
+        QTimer::singleShot(100, &window, [&window]() {
+            window.runVisionProbeTest();
+        });
+    }
+    const QString visionLaunchTest = qEnvironmentVariable("RV1126BLAB_VISION_LAUNCH_TEST");
+    if (visionLaunchTest == QStringLiteral("camera")
+        || visionLaunchTest == QStringLiteral("aispark")) {
+        bool launchDurationOk = false;
+        const int launchDuration = qEnvironmentVariableIntValue(
+            "RV1126BLAB_VISION_LAUNCH_MS", &launchDurationOk);
+        QTimer::singleShot(200, &window, [&window, visionLaunchTest,
+            launchDurationOk, launchDuration]() {
+            window.runVisionLaunchTest(visionLaunchTest,
+                launchDurationOk ? launchDuration : 2500);
         });
     }
 
