@@ -41,7 +41,9 @@ wsl -e sh -lc "cd /mnt/d/WorkSpace/RV1126B && ./apps/rv1126b_lab/build_wsl.sh"
 powershell -ExecutionPolicy Bypass -File .\apps\rv1126b_lab\install.ps1
 ```
 
-安装位置为 `/opt/ui/src/apps/rv1126blab`，桌面入口追加到普通应用页 `apk2.cfg`（与 LED、按键、ADC 调速灯同页），不会占用底部 Dock 的 `apk3.cfg`。安装脚本不会自动重启开发板；重启后桌面会出现“RV1126B实验台”。
+安装位置为 `/opt/ui/src/apps/rv1126blab`。桌面入口固定为第二页 `apk2.cfg` 的第一个图标，不会占用底部 Dock 的 `apk3.cfg`，也不会落入第二页清理模块覆盖的第二行。安装时会移除功能重复的独立“ADC 调速灯”桌面入口，但不会删除其程序文件；ADC 调速功能已包含在实验台内。安装脚本不会自动重启开发板，重启后桌面会出现“RV1126B实验台”。
+
+程序顶部和底部都提供返回入口。由于厂商的控制中心/动态岛可能覆盖屏幕顶部触摸区，底部红色“返回桌面”是主要入口；点击它或从该区域开始上滑都会立即隐藏实验台并退出，随后由 SystemUI 恢复桌面。
 
 ## 已完成的实机验证
 

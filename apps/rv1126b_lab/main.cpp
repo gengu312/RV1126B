@@ -2249,7 +2249,7 @@ public:
 
     void runExitButtonTest()
     {
-        m_exitButton->click();
+        m_bottomExitButton->click();
     }
 
 protected:
@@ -2333,6 +2333,20 @@ private:
                 activateWindow();
             }
         };
+
+        m_returnBar = new QFrame(this);
+        m_returnBar->setObjectName(QStringLiteral("returnBar"));
+        m_returnBar->setFixedHeight(76);
+        auto *returnLayout = new QHBoxLayout(m_returnBar);
+        returnLayout->setContentsMargins(18, 8, 18, 8);
+        m_bottomExitButton = new QPushButton(
+            QString::fromUtf8("↑  点击或从这里上滑返回桌面"), m_returnBar);
+        m_bottomExitButton->setObjectName(QStringLiteral("bottomExitButton"));
+        connect(m_bottomExitButton, &QPushButton::pressed,
+            this, [this]() { requestExit(); });
+        returnLayout->addWidget(m_bottomExitButton);
+        root->addWidget(m_returnBar);
+
         layoutHeader();
         showPage(0);
     }
@@ -2378,10 +2392,13 @@ private:
 
     void requestExit()
     {
-        if (!m_exitButton->isEnabled())
+        if (m_exitRequested)
             return;
+        m_exitRequested = true;
         m_exitButton->setEnabled(false);
-        QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+        m_bottomExitButton->setEnabled(false);
+        hide();
+        QTimer::singleShot(0, qApp, []() { QCoreApplication::exit(0); });
     }
 
     void updateSystem()
@@ -2423,6 +2440,22 @@ private:
                 min-width: 142px;
                 border-color: #7f3340;
                 background-color: #702b37;
+            }
+            QFrame#returnBar {
+                background-color: #111c30;
+                border-top: 1px solid #33445f;
+            }
+            QPushButton#bottomExitButton {
+                min-height: 58px;
+                border: 2px solid #a34151;
+                border-radius: 14px;
+                background-color: #702b37;
+                color: #ffffff;
+                font-size: 24px;
+                font-weight: 700;
+            }
+            QPushButton#bottomExitButton:pressed {
+                background-color: #9b3d4e;
             }
             QFrame#panel {
                 background-color: #172238;
@@ -2561,9 +2594,12 @@ private:
     HardwarePage *m_hardwarePage = nullptr;
     HelpPage *m_helpPage = nullptr;
     QFrame *m_header = nullptr;
+    QFrame *m_returnBar = nullptr;
     QPushButton *m_backButton = nullptr;
     QPushButton *m_exitButton = nullptr;
+    QPushButton *m_bottomExitButton = nullptr;
     QLabel *m_titleLabel = nullptr;
+    bool m_exitRequested = false;
     QTimer m_systemTimer;
     CpuCounters m_previousCpu;
 };
