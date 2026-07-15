@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QCloseEvent>
 #include <QDateTime>
+#include <QDataStream>
 #include <QDir>
 #include <QEvent>
 #include <QFile>
@@ -16,9 +17,11 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QProgressBar>
+#include <QProcess>
 #include <QPushButton>
 #include <QPixmap>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSlider>
 #include <QSizePolicy>
 #include <QStackedWidget>
@@ -303,8 +306,10 @@ public:
             QString::fromUtf8("触点、坐标、轨迹"), 0, 1, 2);
         addModuleButton(grid, QString::fromUtf8("系统监控"),
             QString::fromUtf8("CPU、内存、温度、设备"), 1, 0, 3);
+        addModuleButton(grid, QString::fromUtf8("音频实验"),
+            QString::fromUtf8("录音、波形、音量、回放"), 1, 1, 4);
         addModuleButton(grid, QString::fromUtf8("实验说明"),
-            QString::fromUtf8("第一阶段验收内容"), 1, 1, 4);
+            QString::fromUtf8("当前阶段的演示与验收内容"), 2, 0, 5, 1, 2);
         root->addLayout(grid, 1);
 
         auto *status = makePanel(this);
@@ -354,7 +359,7 @@ private:
     }
 
     void addModuleButton(QGridLayout *layout, const QString &title, const QString &detail,
-        int row, int column, int page)
+        int row, int column, int page, int rowSpan = 1, int columnSpan = 1)
     {
         auto *button = new QPushButton(QString::fromUtf8("%1\n%2").arg(title, detail), this);
         button->setObjectName(QStringLiteral("moduleButton"));
@@ -362,7 +367,7 @@ private:
             if (onNavigate)
                 onNavigate(page);
         });
-        layout->addWidget(button, row, column);
+        layout->addWidget(button, row, column, rowSpan, columnSpan);
     }
 
     QLabel *m_cpuLabel = nullptr;
@@ -729,6 +734,431 @@ private:
     bool m_readOnly = false;
 };
 
+class AudioWaveform final : public QWidget
+{
+public:
+    explicit AudioWaveform(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        setMinimumHeight(300);
+    }
+
+    void setSamples(const QVector<qint16> &samples)
+    {
+        m_samples = samples;
+        update();
+    }
+
+    void clear()
+    {
+        m_samples.clear();
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.fillRect(rect(), QColor(QStringLiteral("#08111f")));
+
+        const QRectF plot = rect().adjusted(18, 18, -18, -18);
+        painter.setPen(QPen(QColor(QStringLiteral("#23354b")), 1));
+        painter.drawLine(QPointF(plot.left(), plot.center().y()),
+            QPointF(plot.right(), plot.center().y()));
+        for (int i = 0; i <= 6; ++i) {
+            const qreal x = plot.left() + plot.width() * i / 6.0;
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
+        }
+
+        if (m_samples.size() < 2) {
+            painter.setPen(QColor(QStringLiteral("#8fa6bf")));
+            QFont hint = painter.font();
+            hint.setPixelSize(25);
+            painter.setFont(hint);
+            painter.drawText(plot, Qt::AlignCenter,
+                QString::fromUtf8("点击“开始录音”后，对着板子说话"));
+            return;
+        }
+
+        QPainterPath path;
+        for (int i = 0; i < m_samples.size(); ++i) {
+            const qreal x = plot.left() + plot.width() * i / std::max(1, m_samples.size() - 1);
+            const qreal normalized = qBound(-1.0, m_samples.at(i) / 32768.0, 1.0);
+            const qreal y = plot.center().y() - normalized * plot.height() * 0.46;
+            if (i == 0)
+                path.moveTo(x, y);
+            else
+                path.lineTo(x, y);
+        }
+        painter.setPen(QPen(QColor(QStringLiteral("#4ade80")), 4,
+            Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.drawPath(path);
+    }
+
+private:
+    QVector<qint16> m_samples;
+};
+
+class AudioPage final : public QWidget
+{
+public:
+    explicit AudioPage(QWidget *parent = nullptr)
+        : QWidget(parent)
+        , m_audioDir(qEnvironmentVariable("RV1126BLAB_AUDIO_DIR",
+              "/userdata/rv1126b_lab/audio"))
+    {
+        setupUi();
+
+        connect(&m_recorder, &QProcess::readyReadStandardOutput, this, [this]() {
+            consumeAudio(m_recorder.readAllStandardOutput());
+        });
+        connect(&m_recorder,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this](int, QProcess::ExitStatus) {
+                consumeAudio(m_recorder.readAllStandardOutput());
+                finishRecording();
+            });
+        connect(&m_recorder, &QProcess::errorOccurred, this,
+            [this](QProcess::ProcessError error) {
+                if (error == QProcess::FailedToStart) {
+                    m_recordingFinalized = true;
+                    restoreMixer();
+                    setRecordingUi(false);
+                    m_statusLabel->setText(QString::fromUtf8("录音启动失败，请检查 arecord。"));
+                }
+            });
+        connect(&m_player,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this](int exitCode, QProcess::ExitStatus) {
+                m_playButton->setEnabled(!m_lastWav.isEmpty());
+                m_statusLabel->setText(exitCode == 0
+                        ? QString::fromUtf8("回放完成：%1").arg(QFileInfo(m_lastWav).fileName())
+                        : QString::fromUtf8("回放失败，请检查扬声器和音量。"));
+            });
+    }
+
+    ~AudioPage() override
+    {
+        if (m_recorder.state() != QProcess::NotRunning) {
+            m_recorder.kill();
+            m_recorder.waitForFinished(500);
+        }
+        if (m_player.state() != QProcess::NotRunning) {
+            m_player.kill();
+            m_player.waitForFinished(300);
+        }
+        restoreMixer();
+    }
+
+    void runAutomatedTest(int durationMs)
+    {
+        startRecording();
+        QTimer::singleShot(qBound(500, durationMs, 5000), this, [this]() {
+            stopRecording();
+        });
+    }
+
+private:
+    void setupUi()
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 18, 28, 24);
+        root->setSpacing(15);
+
+        auto *infoPanel = makePanel(this);
+        auto *infoLayout = new QVBoxLayout(infoPanel);
+        infoLayout->setContentsMargins(20, 14, 20, 14);
+        auto *title = makeSectionTitle(QString::fromUtf8("ES8390 音频采集"), infoPanel);
+        auto *detail = new QLabel(QString::fromUtf8(
+            "16 kHz · 单声道 · 16 bit PCM · 最长 60 秒 · 自动保存 WAV"), infoPanel);
+        detail->setObjectName(QStringLiteral("muted"));
+        infoLayout->addWidget(title);
+        infoLayout->addWidget(detail);
+        root->addWidget(infoPanel);
+
+        m_waveform = new AudioWaveform(this);
+        root->addWidget(m_waveform, 1);
+
+        auto *levelRow = new QHBoxLayout;
+        auto *levelTitle = new QLabel(QString::fromUtf8("实时音量"), this);
+        levelTitle->setObjectName(QStringLiteral("statusText"));
+        m_level = new QProgressBar(this);
+        m_level->setRange(0, 100);
+        m_level->setTextVisible(false);
+        m_levelValue = new QLabel(QStringLiteral("-60 dB"), this);
+        m_levelValue->setObjectName(QStringLiteral("statusText"));
+        m_levelValue->setMinimumWidth(105);
+        m_levelValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        levelRow->addWidget(levelTitle);
+        levelRow->addWidget(m_level, 1);
+        levelRow->addWidget(m_levelValue);
+        root->addLayout(levelRow);
+
+        m_statusLabel = new QLabel(QString::fromUtf8("就绪：点击开始录音"), this);
+        m_statusLabel->setObjectName(QStringLiteral("largeStatus"));
+        m_statusLabel->setAlignment(Qt::AlignCenter);
+        m_statusLabel->setWordWrap(true);
+        root->addWidget(m_statusLabel);
+
+        auto *buttons = new QGridLayout;
+        buttons->setHorizontalSpacing(14);
+        buttons->setVerticalSpacing(14);
+        m_recordButton = new QPushButton(QString::fromUtf8("● 开始录音"), this);
+        m_recordButton->setObjectName(QStringLiteral("actionButton"));
+        m_stopButton = new QPushButton(QString::fromUtf8("■ 停止并保存"), this);
+        m_stopButton->setObjectName(QStringLiteral("actionButton"));
+        m_playButton = new QPushButton(QString::fromUtf8("▶ 回放上次录音"), this);
+        m_playButton->setObjectName(QStringLiteral("actionButton"));
+        m_stopButton->setEnabled(false);
+        m_playButton->setEnabled(false);
+        connect(m_recordButton, &QPushButton::clicked, this, [this]() { startRecording(); });
+        connect(m_stopButton, &QPushButton::clicked, this, [this]() { stopRecording(); });
+        connect(m_playButton, &QPushButton::clicked, this, [this]() { playLastRecording(); });
+        buttons->addWidget(m_recordButton, 0, 0);
+        buttons->addWidget(m_stopButton, 0, 1);
+        buttons->addWidget(m_playButton, 1, 0, 1, 2);
+        root->addLayout(buttons);
+
+        auto *safety = new QLabel(QString::fromUtf8(
+            "录音时只临时提高麦克风采集增益，不打开 ADC 到扬声器直通；停止或退出后恢复原 ALSA 状态。"), this);
+        safety->setObjectName(QStringLiteral("notice"));
+        safety->setWordWrap(true);
+        safety->setAlignment(Qt::AlignCenter);
+        root->addWidget(safety);
+    }
+
+    bool configureMixer()
+    {
+        if (qEnvironmentVariableIsSet("RV1126BLAB_AUDIO_NO_MIXER"))
+            return true;
+
+        m_mixerState = QString::fromUtf8("/tmp/rv1126blab-mixer-%1.state")
+            .arg(QCoreApplication::applicationPid());
+        if (QProcess::execute(QStringLiteral("/usr/sbin/alsactl"),
+                { QStringLiteral("-f"), m_mixerState, QStringLiteral("store"),
+                    QStringLiteral("0") }) != 0) {
+            m_mixerState.clear();
+            return false;
+        }
+
+        const QVector<QStringList> settings = {
+            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                QStringLiteral("set"), QStringLiteral("ADC OSR Volume ON"),
+                QStringLiteral("on") },
+            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                QStringLiteral("set"), QStringLiteral("ADCL"), QStringLiteral("85%") },
+            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                QStringLiteral("set"), QStringLiteral("ADCL PGA"), QStringLiteral("50%") },
+            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                QStringLiteral("set"), QStringLiteral("ADCR"), QStringLiteral("85%") },
+            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                QStringLiteral("set"), QStringLiteral("ADCR PGA"), QStringLiteral("50%") }
+        };
+        for (const QStringList &arguments : settings) {
+            if (QProcess::execute(QStringLiteral("/usr/bin/amixer"), arguments) != 0) {
+                restoreMixer();
+                return false;
+            }
+        }
+        m_mixerConfigured = true;
+        return true;
+    }
+
+    void restoreMixer()
+    {
+        if (!m_mixerConfigured && m_mixerState.isEmpty())
+            return;
+        if (!m_mixerState.isEmpty()) {
+            QProcess::execute(QStringLiteral("/usr/sbin/alsactl"),
+                { QStringLiteral("-f"), m_mixerState, QStringLiteral("restore"),
+                    QStringLiteral("0") });
+            QFile::remove(m_mixerState);
+        }
+        m_mixerConfigured = false;
+        m_mixerState.clear();
+    }
+
+    void startRecording()
+    {
+        if (m_recorder.state() != QProcess::NotRunning)
+            return;
+        if (m_player.state() != QProcess::NotRunning)
+            m_player.kill();
+        if (!QFile::exists(QStringLiteral("/usr/bin/arecord"))) {
+            m_statusLabel->setText(QString::fromUtf8("系统中没有 arecord。"));
+            return;
+        }
+        if (!configureMixer()) {
+            m_statusLabel->setText(QString::fromUtf8("无法保存或设置 ALSA 状态，已取消录音。"));
+            return;
+        }
+
+        m_pcm.clear();
+        m_waveform->clear();
+        m_level->setValue(0);
+        m_levelValue->setText(QStringLiteral("-60 dB"));
+        m_recordingFinalized = false;
+        m_recorder.setProcessChannelMode(QProcess::SeparateChannels);
+        m_recorder.start(QStringLiteral("/usr/bin/arecord"), {
+            QStringLiteral("-q"), QStringLiteral("-D"), QStringLiteral("default"),
+            QStringLiteral("-t"), QStringLiteral("raw"), QStringLiteral("-f"),
+            QStringLiteral("S16_LE"), QStringLiteral("-c"), QStringLiteral("1"),
+            QStringLiteral("-r"), QStringLiteral("16000"), QStringLiteral("-")
+        });
+        setRecordingUi(true);
+        m_statusLabel->setText(QString::fromUtf8("正在录音：0.0 秒"));
+    }
+
+    void stopRecording()
+    {
+        if (m_recorder.state() == QProcess::NotRunning)
+            return;
+        m_statusLabel->setText(QString::fromUtf8("正在停止并保存……"));
+        m_stopButton->setEnabled(false);
+        m_recorder.terminate();
+        QTimer::singleShot(800, this, [this]() {
+            if (m_recorder.state() != QProcess::NotRunning)
+                m_recorder.kill();
+        });
+    }
+
+    void consumeAudio(const QByteArray &data)
+    {
+        if (data.isEmpty())
+            return;
+        m_pcm.append(data);
+
+        const int sampleCount = data.size() / 2;
+        if (sampleCount <= 0)
+            return;
+        const auto *bytes = reinterpret_cast<const uchar *>(data.constData());
+        long double energy = 0.0;
+        QVector<qint16> waveform;
+        const int step = std::max(1, sampleCount / 180);
+        waveform.reserve(sampleCount / step + 1);
+        for (int i = 0; i < sampleCount; ++i) {
+            const qint16 sample = static_cast<qint16>(bytes[i * 2]
+                | (static_cast<quint16>(bytes[i * 2 + 1]) << 8));
+            energy += static_cast<long double>(sample) * sample;
+            if (i % step == 0)
+                waveform.append(sample);
+        }
+        m_waveform->setSamples(waveform);
+
+        const double rms = std::sqrt(static_cast<double>(energy / sampleCount));
+        const double db = rms > 0.0 ? 20.0 * std::log10(rms / 32768.0) : -60.0;
+        const double boundedDb = qBound(-60.0, db, 0.0);
+        m_level->setValue(qRound((boundedDb + 60.0) * 100.0 / 60.0));
+        m_levelValue->setText(QString::fromUtf8("%1 dB").arg(boundedDb, 0, 'f', 1));
+
+        const double duration = m_pcm.size() / 2.0 / 16000.0;
+        m_statusLabel->setText(QString::fromUtf8("正在录音：%1 秒").arg(duration, 0, 'f', 1));
+        if (duration >= 60.0)
+            stopRecording();
+    }
+
+    void finishRecording()
+    {
+        if (m_recordingFinalized)
+            return;
+        m_recordingFinalized = true;
+        setRecordingUi(false);
+
+        if (m_pcm.size() % 2 != 0)
+            m_pcm.chop(1);
+        const QString savedPath = saveWav();
+        restoreMixer();
+
+        if (savedPath.isEmpty()) {
+            m_statusLabel->setText(QString::fromUtf8("没有收到有效音频，未保存。"));
+            return;
+        }
+        m_lastWav = savedPath;
+        m_playButton->setEnabled(true);
+        m_statusLabel->setText(QString::fromUtf8("已保存：%1（%2 秒）")
+            .arg(QFileInfo(savedPath).fileName())
+            .arg(m_pcm.size() / 2.0 / 16000.0, 0, 'f', 1));
+    }
+
+    QString saveWav()
+    {
+        if (m_pcm.isEmpty())
+            return {};
+        if (!QDir().mkpath(m_audioDir))
+            return {};
+
+        const QString fileName = QString::fromUtf8("recording-%1-%2-%3.wav")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")))
+            .arg(QCoreApplication::applicationPid())
+            .arg(++m_recordSequence);
+        const QString path = QDir(m_audioDir).filePath(fileName);
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly))
+            return {};
+
+        QDataStream stream(&file);
+        stream.setByteOrder(QDataStream::LittleEndian);
+        const quint32 dataSize = static_cast<quint32>(m_pcm.size());
+        stream.writeRawData("RIFF", 4);
+        stream << static_cast<quint32>(36 + dataSize);
+        stream.writeRawData("WAVE", 4);
+        stream.writeRawData("fmt ", 4);
+        stream << static_cast<quint32>(16);
+        stream << static_cast<quint16>(1);
+        stream << static_cast<quint16>(1);
+        stream << static_cast<quint32>(16000);
+        stream << static_cast<quint32>(32000);
+        stream << static_cast<quint16>(2);
+        stream << static_cast<quint16>(16);
+        stream.writeRawData("data", 4);
+        stream << dataSize;
+        stream.writeRawData(m_pcm.constData(), m_pcm.size());
+        return file.commit() ? path : QString();
+    }
+
+    void playLastRecording()
+    {
+        if (m_lastWav.isEmpty() || !QFile::exists(m_lastWav)
+            || m_player.state() != QProcess::NotRunning) {
+            return;
+        }
+        m_playButton->setEnabled(false);
+        m_statusLabel->setText(QString::fromUtf8("正在回放：%1")
+            .arg(QFileInfo(m_lastWav).fileName()));
+        m_player.start(QStringLiteral("/usr/bin/aplay"),
+            { QStringLiteral("-q"), m_lastWav });
+    }
+
+    void setRecordingUi(bool recording)
+    {
+        m_recordButton->setEnabled(!recording);
+        m_stopButton->setEnabled(recording);
+        if (recording)
+            m_playButton->setEnabled(false);
+        else
+            m_playButton->setEnabled(!m_lastWav.isEmpty()
+                && m_player.state() == QProcess::NotRunning);
+    }
+
+    QString m_audioDir;
+    QString m_lastWav;
+    QString m_mixerState;
+    QByteArray m_pcm;
+    QProcess m_recorder;
+    QProcess m_player;
+    AudioWaveform *m_waveform = nullptr;
+    QProgressBar *m_level = nullptr;
+    QLabel *m_levelValue = nullptr;
+    QLabel *m_statusLabel = nullptr;
+    QPushButton *m_recordButton = nullptr;
+    QPushButton *m_stopButton = nullptr;
+    QPushButton *m_playButton = nullptr;
+    bool m_mixerConfigured = false;
+    bool m_recordingFinalized = true;
+    int m_recordSequence = 0;
+};
+
 class TouchCanvas final : public QWidget
 {
 public:
@@ -1069,7 +1499,8 @@ public:
             "2. IO / ADC 页：旋转蓝色电位器，观察原始值、电压、滤波值和曲线；"
             "拖动阈值并演示 LED 联动，再切换 ADC 调速闪烁。\n\n"
             "3. 五点触摸页：先单指画轨迹，再逐步增加到五指，展示独立编号、坐标和距离。\n\n"
-            "4. 返回主页并退出，说明程序会恢复进入前的 LED 状态。"), content);
+            "4. 音频页：录制一段语音，观察音量和波形，停止后触摸回放。\n\n"
+            "5. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
         steps->setObjectName(QStringLiteral("helpText"));
         steps->setWordWrap(true);
         layout->addWidget(steps);
@@ -1103,6 +1534,12 @@ public:
     void openPageForTest(int index)
     {
         showPage(index);
+    }
+
+    void runAudioTest(int durationMs)
+    {
+        showPage(4);
+        m_audioPage->runAutomatedTest(durationMs);
     }
 
 protected:
@@ -1155,11 +1592,13 @@ private:
         m_ioPage = new IoPage(m_stack);
         m_touchPage = new TouchPage(m_stack);
         m_systemPage = new SystemPage(m_stack);
+        m_audioPage = new AudioPage(m_stack);
         m_helpPage = new HelpPage(m_stack);
         m_stack->addWidget(m_homePage);
         m_stack->addWidget(m_ioPage);
         m_stack->addWidget(m_touchPage);
         m_stack->addWidget(m_systemPage);
+        m_stack->addWidget(m_audioPage);
         m_stack->addWidget(m_helpPage);
         root->addWidget(m_stack, 1);
 
@@ -1179,6 +1618,7 @@ private:
             QString::fromUtf8("IO / ADC 实验"),
             QString::fromUtf8("五点触摸实验"),
             QString::fromUtf8("系统监控"),
+            QString::fromUtf8("音频采集与波形"),
             QString::fromUtf8("实验说明")
         };
         m_stack->setCurrentIndex(index);
@@ -1288,7 +1728,7 @@ private:
                 color: #e4edf7;
             }
             QPushButton#moduleButton {
-                min-height: 215px;
+                min-height: 156px;
                 padding: 16px;
                 border: 2px solid #334b69;
                 border-radius: 22px;
@@ -1363,6 +1803,7 @@ private:
     IoPage *m_ioPage = nullptr;
     TouchPage *m_touchPage = nullptr;
     SystemPage *m_systemPage = nullptr;
+    AudioPage *m_audioPage = nullptr;
     HelpPage *m_helpPage = nullptr;
     QPushButton *m_backButton = nullptr;
     QPushButton *m_exitButton = nullptr;
@@ -1395,9 +1836,15 @@ int main(int argc, char *argv[])
             window.grab().save(screenshotPath, "PNG");
         });
     }
-    if (startPageOk) {
-        QTimer::singleShot(0, &window, [&window, startPage]() {
-            window.openPageForTest(startPage);
+    QTimer::singleShot(0, &window, [&window, startPageOk, startPage]() {
+        window.openPageForTest(startPageOk ? startPage : 0);
+    });
+    bool audioTestOk = false;
+    const int audioTestMs = qEnvironmentVariableIntValue(
+        "RV1126BLAB_AUDIO_TEST_MS", &audioTestOk);
+    if (audioTestOk && audioTestMs > 0) {
+        QTimer::singleShot(100, &window, [&window, audioTestMs]() {
+            window.runAudioTest(audioTestMs);
         });
     }
 
