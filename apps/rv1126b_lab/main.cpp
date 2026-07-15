@@ -1,0 +1,1410 @@
+#include <QApplication>
+#include <QCloseEvent>
+#include <QDateTime>
+#include <QDir>
+#include <QEvent>
+#include <QFile>
+#include <QFileInfo>
+#include <QFont>
+#include <QFrame>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QMap>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QProgressBar>
+#include <QPushButton>
+#include <QPixmap>
+#include <QRegularExpression>
+#include <QSlider>
+#include <QSizePolicy>
+#include <QStackedWidget>
+#include <QStyle>
+#include <QTimer>
+#include <QTouchEvent>
+#include <QVector>
+#include <QVBoxLayout>
+#include <QWidget>
+
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
+namespace {
+
+QString readText(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+    return QString::fromUtf8(file.readAll());
+}
+
+bool writeText(const QString &path, const QByteArray &value)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly))
+        return false;
+    return file.write(value) == value.size();
+}
+
+QString oneLine(const QString &path, const QString &fallback = QString::fromUtf8("未知"))
+{
+    const QString value = readText(path).trimmed();
+    return value.isEmpty() ? fallback : value;
+}
+
+QString formatBytes(quint64 bytes)
+{
+    const double gib = bytes / 1024.0 / 1024.0 / 1024.0;
+    if (gib >= 1.0)
+        return QString::fromUtf8("%1 GB").arg(gib, 0, 'f', 1);
+    return QString::fromUtf8("%1 MB").arg(bytes / 1024.0 / 1024.0, 0, 'f', 0);
+}
+
+QFrame *makePanel(QWidget *parent = nullptr)
+{
+    auto *panel = new QFrame(parent);
+    panel->setObjectName(QStringLiteral("panel"));
+    return panel;
+}
+
+QLabel *makeSectionTitle(const QString &text, QWidget *parent = nullptr)
+{
+    auto *label = new QLabel(text, parent);
+    label->setObjectName(QStringLiteral("sectionTitle"));
+    return label;
+}
+
+struct CpuCounters {
+    quint64 total = 0;
+    quint64 idle = 0;
+    bool valid = false;
+};
+
+CpuCounters readCpuCounters()
+{
+    const QString firstLine = readText(QStringLiteral("/proc/stat")).section('\n', 0, 0);
+    const QStringList parts = firstLine.simplified().split(' ');
+    if (parts.size() < 5 || parts.first() != QStringLiteral("cpu"))
+        return {};
+
+    CpuCounters result;
+    QVector<quint64> values;
+    for (int i = 1; i < parts.size(); ++i) {
+        bool ok = false;
+        const quint64 value = parts.at(i).toULongLong(&ok);
+        if (!ok)
+            return {};
+        values.append(value);
+        result.total += value;
+    }
+    result.idle = values.value(3) + values.value(4);
+    result.valid = true;
+    return result;
+}
+
+struct SystemSnapshot {
+    double cpuPercent = 0.0;
+    double memoryPercent = 0.0;
+    double storagePercent = 0.0;
+    double temperatureC = 0.0;
+    quint64 memoryTotal = 0;
+    quint64 memoryAvailable = 0;
+    quint64 storageTotal = 0;
+    quint64 storageAvailable = 0;
+    qint64 uptimeSeconds = 0;
+    QString ethState;
+    QString wifiState;
+    bool cameraReady = false;
+    bool npuReady = false;
+};
+
+quint64 memInfoValue(const QString &name)
+{
+    const QStringList lines = readText(QStringLiteral("/proc/meminfo")).split('\n');
+    for (const QString &line : lines) {
+        if (!line.startsWith(name + ':'))
+            continue;
+        const QRegularExpressionMatch match = QRegularExpression(QStringLiteral("(\\d+)"))
+            .match(line);
+        if (match.hasMatch())
+            return match.captured(1).toULongLong() * 1024ULL;
+    }
+    return 0;
+}
+
+SystemSnapshot sampleSystem(const CpuCounters &previous, CpuCounters *current)
+{
+    SystemSnapshot snapshot;
+    *current = readCpuCounters();
+    if (previous.valid && current->valid && current->total > previous.total) {
+        const quint64 totalDelta = current->total - previous.total;
+        const quint64 idleDelta = current->idle - previous.idle;
+        snapshot.cpuPercent = 100.0 * (totalDelta - std::min(totalDelta, idleDelta)) / totalDelta;
+    }
+
+    snapshot.memoryTotal = memInfoValue(QStringLiteral("MemTotal"));
+    snapshot.memoryAvailable = memInfoValue(QStringLiteral("MemAvailable"));
+    if (snapshot.memoryTotal > 0) {
+        snapshot.memoryPercent = 100.0
+            * (snapshot.memoryTotal - std::min(snapshot.memoryTotal, snapshot.memoryAvailable))
+            / snapshot.memoryTotal;
+    }
+
+    struct statvfs storage {};
+    if (statvfs("/", &storage) == 0) {
+        snapshot.storageTotal = static_cast<quint64>(storage.f_blocks) * storage.f_frsize;
+        snapshot.storageAvailable = static_cast<quint64>(storage.f_bavail) * storage.f_frsize;
+        if (snapshot.storageTotal > 0) {
+            snapshot.storagePercent = 100.0
+                * (snapshot.storageTotal - std::min(snapshot.storageTotal, snapshot.storageAvailable))
+                / snapshot.storageTotal;
+        }
+    }
+
+    bool temperatureOk = false;
+    const double rawTemperature = oneLine(QStringLiteral("/sys/class/thermal/thermal_zone0/temp"),
+        QStringLiteral("0")).toDouble(&temperatureOk);
+    if (temperatureOk)
+        snapshot.temperatureC = rawTemperature > 1000.0 ? rawTemperature / 1000.0 : rawTemperature;
+
+    bool uptimeOk = false;
+    snapshot.uptimeSeconds = readText(QStringLiteral("/proc/uptime"))
+        .section(' ', 0, 0).toDouble(&uptimeOk);
+    if (!uptimeOk)
+        snapshot.uptimeSeconds = 0;
+
+    snapshot.ethState = oneLine(QStringLiteral("/sys/class/net/eth0/operstate"),
+        QString::fromUtf8("无设备"));
+    snapshot.wifiState = oneLine(QStringLiteral("/sys/class/net/wlan0/operstate"),
+        QString::fromUtf8("无设备"));
+    snapshot.cameraReady = QFile::exists(QStringLiteral("/dev/video-camera0"));
+    snapshot.npuReady = QFile::exists(QStringLiteral("/dev/rknpu"));
+    return snapshot;
+}
+
+QString uptimeText(qint64 seconds)
+{
+    const qint64 days = seconds / 86400;
+    const qint64 hours = (seconds % 86400) / 3600;
+    const qint64 minutes = (seconds % 3600) / 60;
+    if (days > 0)
+        return QString::fromUtf8("%1天 %2小时").arg(days).arg(hours);
+    return QString::fromUtf8("%1小时 %2分钟").arg(hours).arg(minutes);
+}
+
+class LineChart final : public QWidget
+{
+public:
+    explicit LineChart(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        setMinimumHeight(250);
+    }
+
+    void setValues(const QVector<int> &values)
+    {
+        m_values = values;
+        update();
+    }
+
+    void setThreshold(int value)
+    {
+        m_threshold = value;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.fillRect(rect(), QColor(QStringLiteral("#0b1220")));
+
+        const QRectF plot = rect().adjusted(18, 18, -18, -24);
+        painter.setPen(QPen(QColor(QStringLiteral("#263449")), 1));
+        for (int i = 0; i <= 4; ++i) {
+            const qreal y = plot.top() + plot.height() * i / 4.0;
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+        }
+        for (int i = 0; i <= 6; ++i) {
+            const qreal x = plot.left() + plot.width() * i / 6.0;
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
+        }
+
+        if (m_threshold >= 0) {
+            const qreal y = plot.bottom() - plot.height() * m_threshold / 8191.0;
+            painter.setPen(QPen(QColor(QStringLiteral("#f59e0b")), 2, Qt::DashLine));
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+        }
+
+        if (m_values.size() < 2)
+            return;
+
+        QPainterPath path;
+        for (int i = 0; i < m_values.size(); ++i) {
+            const qreal x = plot.left() + plot.width() * i / std::max(1, m_values.size() - 1);
+            const qreal y = plot.bottom() - plot.height() * qBound(0, m_values.at(i), 8191) / 8191.0;
+            if (i == 0)
+                path.moveTo(x, y);
+            else
+                path.lineTo(x, y);
+        }
+        painter.setPen(QPen(QColor(QStringLiteral("#38bdf8")), 4,
+            Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.drawPath(path);
+    }
+
+private:
+    QVector<int> m_values;
+    int m_threshold = -1;
+};
+
+class HomePage final : public QWidget
+{
+public:
+    explicit HomePage(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 24, 28, 26);
+        root->setSpacing(22);
+
+        auto *welcome = new QLabel(QString::fromUtf8("RV1126B 触摸软件实验台"), this);
+        welcome->setObjectName(QStringLiteral("heroTitle"));
+        welcome->setAlignment(Qt::AlignCenter);
+        root->addWidget(welcome);
+
+        auto *subtitle = new QLabel(
+            QString::fromUtf8("一个入口完成板卡状态、IO/ADC 和触摸实验"), this);
+        subtitle->setObjectName(QStringLiteral("muted"));
+        subtitle->setAlignment(Qt::AlignCenter);
+        root->addWidget(subtitle);
+
+        auto *metrics = new QHBoxLayout;
+        metrics->setSpacing(14);
+        metrics->addWidget(metricCard(QString::fromUtf8("CPU"), m_cpuLabel));
+        metrics->addWidget(metricCard(QString::fromUtf8("温度"), m_temperatureLabel));
+        metrics->addWidget(metricCard(QString::fromUtf8("ADC"), m_adcLabel));
+        root->addLayout(metrics);
+
+        auto *grid = new QGridLayout;
+        grid->setHorizontalSpacing(18);
+        grid->setVerticalSpacing(18);
+        addModuleButton(grid, QString::fromUtf8("IO / ADC"),
+            QString::fromUtf8("旋钮、曲线、阈值、LED"), 0, 0, 1);
+        addModuleButton(grid, QString::fromUtf8("五点触摸"),
+            QString::fromUtf8("触点、坐标、轨迹"), 0, 1, 2);
+        addModuleButton(grid, QString::fromUtf8("系统监控"),
+            QString::fromUtf8("CPU、内存、温度、设备"), 1, 0, 3);
+        addModuleButton(grid, QString::fromUtf8("实验说明"),
+            QString::fromUtf8("第一阶段验收内容"), 1, 1, 4);
+        root->addLayout(grid, 1);
+
+        auto *status = makePanel(this);
+        auto *statusLayout = new QHBoxLayout(status);
+        statusLayout->setContentsMargins(20, 14, 20, 14);
+        m_deviceLabel = new QLabel(status);
+        m_deviceLabel->setObjectName(QStringLiteral("statusText"));
+        m_deviceLabel->setWordWrap(true);
+        statusLayout->addWidget(m_deviceLabel);
+        root->addWidget(status);
+    }
+
+    std::function<void(int)> onNavigate;
+
+    void updateSystem(const SystemSnapshot &snapshot)
+    {
+        m_cpuLabel->setText(QString::fromUtf8("%1%").arg(snapshot.cpuPercent, 0, 'f', 0));
+        m_temperatureLabel->setText(QString::fromUtf8("%1°C").arg(snapshot.temperatureC, 0, 'f', 1));
+        m_deviceLabel->setText(QString::fromUtf8("摄像头 %1    NPU %2    网口 %3    Wi-Fi %4")
+            .arg(snapshot.cameraReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
+            .arg(snapshot.npuReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
+            .arg(snapshot.ethState)
+            .arg(snapshot.wifiState));
+    }
+
+    void updateAdc(int raw)
+    {
+        m_adcLabel->setText(QString::number(raw));
+    }
+
+private:
+    QWidget *metricCard(const QString &title, QLabel *&value)
+    {
+        auto *panel = makePanel(this);
+        auto *layout = new QVBoxLayout(panel);
+        layout->setContentsMargins(12, 14, 12, 14);
+        layout->setSpacing(4);
+        auto *titleLabel = new QLabel(title, panel);
+        titleLabel->setObjectName(QStringLiteral("metricTitle"));
+        titleLabel->setAlignment(Qt::AlignCenter);
+        value = new QLabel(QStringLiteral("--"), panel);
+        value->setObjectName(QStringLiteral("metricValue"));
+        value->setAlignment(Qt::AlignCenter);
+        layout->addWidget(titleLabel);
+        layout->addWidget(value);
+        return panel;
+    }
+
+    void addModuleButton(QGridLayout *layout, const QString &title, const QString &detail,
+        int row, int column, int page)
+    {
+        auto *button = new QPushButton(QString::fromUtf8("%1\n%2").arg(title, detail), this);
+        button->setObjectName(QStringLiteral("moduleButton"));
+        connect(button, &QPushButton::clicked, this, [this, page]() {
+            if (onNavigate)
+                onNavigate(page);
+        });
+        layout->addWidget(button, row, column);
+    }
+
+    QLabel *m_cpuLabel = nullptr;
+    QLabel *m_temperatureLabel = nullptr;
+    QLabel *m_adcLabel = nullptr;
+    QLabel *m_deviceLabel = nullptr;
+};
+
+class IoPage final : public QWidget
+{
+public:
+    explicit IoPage(QWidget *parent = nullptr)
+        : QWidget(parent)
+        , m_ledRoot(qEnvironmentVariable("RV1126BLAB_LED_PATH", "/sys/class/leds/work"))
+        , m_iioRoot(qEnvironmentVariable("RV1126BLAB_IIO_DEVICE",
+              "/sys/bus/iio/devices/iio:device0"))
+        , m_readOnly(qEnvironmentVariableIsSet("RV1126BLAB_READ_ONLY"))
+    {
+        setupUi();
+        inspectHardware();
+        connect(&m_adcTimer, &QTimer::timeout, this, [this]() { updateAdc(); });
+        connect(&m_blinkTimer, &QTimer::timeout, this, [this]() {
+            if (!setLed(!m_ledOn))
+                m_blinkTimer.stop();
+        });
+        updateAdc();
+        m_adcTimer.start(100);
+    }
+
+    ~IoPage() override
+    {
+        restoreLed();
+    }
+
+    std::function<void(int)> onAdcChanged;
+
+    void leavePage()
+    {
+        if (m_mode != Mode::Observe)
+            setMode(Mode::Observe);
+    }
+
+private:
+    enum class Mode {
+        Observe,
+        Off,
+        On,
+        Threshold,
+        AdcBlink
+    };
+
+    void setupUi()
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 18, 28, 24);
+        root->setSpacing(16);
+
+        auto *topPanel = makePanel(this);
+        auto *top = new QVBoxLayout(topPanel);
+        top->setContentsMargins(20, 16, 20, 16);
+        top->setSpacing(8);
+        m_valueLabel = new QLabel(topPanel);
+        m_valueLabel->setObjectName(QStringLiteral("adcValue"));
+        m_valueLabel->setAlignment(Qt::AlignCenter);
+        m_statisticsLabel = new QLabel(topPanel);
+        m_statisticsLabel->setObjectName(QStringLiteral("muted"));
+        m_statisticsLabel->setAlignment(Qt::AlignCenter);
+        top->addWidget(m_valueLabel);
+        top->addWidget(m_statisticsLabel);
+        root->addWidget(topPanel);
+
+        m_chart = new LineChart(this);
+        root->addWidget(m_chart, 1);
+
+        m_thresholdLabel = new QLabel(this);
+        m_thresholdLabel->setObjectName(QStringLiteral("statusText"));
+        root->addWidget(m_thresholdLabel);
+
+        m_thresholdSlider = new QSlider(Qt::Horizontal, this);
+        m_thresholdSlider->setRange(0, 8191);
+        m_thresholdSlider->setValue(4096);
+        m_thresholdSlider->setPageStep(256);
+        connect(m_thresholdSlider, &QSlider::valueChanged, this, [this](int value) {
+            m_chart->setThreshold(value);
+            updateThresholdLabel();
+            if (m_mode == Mode::Threshold)
+                applyThresholdMode();
+        });
+        root->addWidget(m_thresholdSlider);
+
+        auto *buttons = new QGridLayout;
+        buttons->setHorizontalSpacing(12);
+        buttons->setVerticalSpacing(12);
+        addModeButton(buttons, QString::fromUtf8("只看数据"), Mode::Observe, 0, 0);
+        addModeButton(buttons, QString::fromUtf8("LED 熄灭"), Mode::Off, 0, 1);
+        addModeButton(buttons, QString::fromUtf8("LED 常亮"), Mode::On, 0, 2);
+        addModeButton(buttons, QString::fromUtf8("阈值联动"), Mode::Threshold, 1, 0);
+        addModeButton(buttons, QString::fromUtf8("ADC 调速闪烁"), Mode::AdcBlink, 1, 1, 1, 2);
+        root->addLayout(buttons);
+
+        auto *bottom = new QHBoxLayout;
+        m_modeLabel = new QLabel(QString::fromUtf8("模式：只看数据，不控制 LED"), this);
+        m_modeLabel->setObjectName(QStringLiteral("statusText"));
+        m_modeLabel->setWordWrap(true);
+        auto *resetButton = new QPushButton(QString::fromUtf8("清空统计"), this);
+        resetButton->setObjectName(QStringLiteral("smallButton"));
+        connect(resetButton, &QPushButton::clicked, this, [this]() { resetStatistics(); });
+        bottom->addWidget(m_modeLabel, 1);
+        bottom->addWidget(resetButton);
+        root->addLayout(bottom);
+
+        m_errorLabel = new QLabel(this);
+        m_errorLabel->setObjectName(QStringLiteral("error"));
+        m_errorLabel->setAlignment(Qt::AlignCenter);
+        m_errorLabel->setWordWrap(true);
+        root->addWidget(m_errorLabel);
+
+        m_chart->setThreshold(m_thresholdSlider->value());
+        updateThresholdLabel();
+    }
+
+    void inspectHardware()
+    {
+        m_hardwareReady = QFile::exists(m_iioRoot + QStringLiteral("/in_voltage4_raw"));
+        m_ledReady = QFile::exists(m_ledRoot + QStringLiteral("/trigger"))
+            && QFile::exists(m_ledRoot + QStringLiteral("/brightness"));
+
+        bool scaleOk = false;
+        const double scale = readText(m_iioRoot + QStringLiteral("/in_voltage_scale"))
+            .trimmed().toDouble(&scaleOk);
+        if (scaleOk)
+            m_scaleMillivolts = scale;
+
+        if (!m_hardwareReady)
+            m_errorLabel->setText(QString::fromUtf8("未找到 SARADC 通道 4。"));
+        else if (!m_ledReady)
+            m_errorLabel->setText(QString::fromUtf8("ADC 可读，但未找到板载工作灯。"));
+        else if (m_readOnly)
+            m_errorLabel->setText(QString::fromUtf8("只读测试模式：不会写入 LED。"));
+    }
+
+    void addModeButton(QGridLayout *layout, const QString &text, Mode mode,
+        int row, int column, int rowSpan = 1, int columnSpan = 1)
+    {
+        auto *button = new QPushButton(text, this);
+        button->setObjectName(QStringLiteral("actionButton"));
+        button->setProperty("active", mode == Mode::Observe);
+        connect(button, &QPushButton::clicked, this, [this, mode]() { setMode(mode); });
+        layout->addWidget(button, row, column, rowSpan, columnSpan);
+        m_modeButtons.append(qMakePair(mode, button));
+    }
+
+    void setMode(Mode mode)
+    {
+        m_blinkTimer.stop();
+        if (mode != Mode::Observe && (!m_ledReady || !claimLed())) {
+            m_errorLabel->setText(QString::fromUtf8("无法接管板载工作灯，请检查权限。"));
+            return;
+        }
+
+        m_mode = mode;
+        switch (mode) {
+        case Mode::Observe:
+            restoreLed();
+            m_modeLabel->setText(QString::fromUtf8("模式：只看数据，不控制 LED"));
+            break;
+        case Mode::Off:
+            setLed(false);
+            m_modeLabel->setText(QString::fromUtf8("模式：LED 熄灭"));
+            break;
+        case Mode::On:
+            setLed(true);
+            m_modeLabel->setText(QString::fromUtf8("模式：LED 常亮"));
+            break;
+        case Mode::Threshold:
+            applyThresholdMode();
+            break;
+        case Mode::AdcBlink:
+            applyBlinkSpeed();
+            setLed(true);
+            m_blinkTimer.start(m_blinkHalfPeriodMs);
+            break;
+        }
+        refreshModeButtons();
+    }
+
+    bool claimLed()
+    {
+        if (m_ledClaimed)
+            return true;
+
+        const QString trigger = readText(m_ledRoot + QStringLiteral("/trigger"));
+        const QRegularExpressionMatch match = QRegularExpression(QStringLiteral("\\[([^\\]]+)\\]"))
+            .match(trigger);
+        m_originalTrigger = match.hasMatch() ? match.captured(1) : QStringLiteral("none");
+        m_originalBrightness = readText(m_ledRoot + QStringLiteral("/brightness")).trimmed();
+
+        if (!m_readOnly && !writeText(m_ledRoot + QStringLiteral("/trigger"), QByteArray("none\n")))
+            return false;
+        m_ledClaimed = true;
+        return true;
+    }
+
+    void restoreLed()
+    {
+        m_blinkTimer.stop();
+        if (!m_ledClaimed)
+            return;
+        if (!m_readOnly) {
+            if (!m_originalTrigger.isEmpty())
+                writeText(m_ledRoot + QStringLiteral("/trigger"), m_originalTrigger.toUtf8() + '\n');
+            if (m_originalTrigger == QStringLiteral("none") && !m_originalBrightness.isEmpty())
+                writeText(m_ledRoot + QStringLiteral("/brightness"),
+                    m_originalBrightness.toUtf8() + '\n');
+        }
+        m_ledClaimed = false;
+        m_ledOn = false;
+    }
+
+    bool setLed(bool on)
+    {
+        if (!m_ledReady)
+            return false;
+        if (!m_readOnly && !writeText(m_ledRoot + QStringLiteral("/brightness"),
+                on ? QByteArray("1\n") : QByteArray("0\n")))
+            return false;
+        m_ledOn = on;
+        return true;
+    }
+
+    void updateAdc()
+    {
+        bool ok = false;
+        const int rawValue = readText(m_iioRoot + QStringLiteral("/in_voltage4_raw"))
+            .trimmed().toInt(&ok);
+        if (!ok) {
+            m_errorLabel->setText(QString::fromUtf8("ADC 读取失败。"));
+            return;
+        }
+
+        m_currentRaw = qBound(0, rawValue, 8191);
+        m_history.append(m_currentRaw);
+        if (m_history.size() > 240)
+            m_history.remove(0, m_history.size() - 240);
+        m_filterWindow.append(m_currentRaw);
+        if (m_filterWindow.size() > 10)
+            m_filterWindow.removeFirst();
+
+        int filterSum = 0;
+        for (int value : m_filterWindow)
+            filterSum += value;
+        const int filtered = filterSum / std::max(1, m_filterWindow.size());
+
+        if (m_sampleCount == 0) {
+            m_minRaw = m_currentRaw;
+            m_maxRaw = m_currentRaw;
+        }
+        m_minRaw = std::min(m_minRaw, m_currentRaw);
+        m_maxRaw = std::max(m_maxRaw, m_currentRaw);
+        m_sumRaw += m_currentRaw;
+        ++m_sampleCount;
+
+        const double millivolts = m_currentRaw * m_scaleMillivolts;
+        m_valueLabel->setText(QString::fromUtf8("raw %1    %2 mV    滤波 %3")
+            .arg(m_currentRaw)
+            .arg(millivolts, 0, 'f', 1)
+            .arg(filtered));
+        m_statisticsLabel->setText(QString::fromUtf8("最小 %1    最大 %2    平均 %3    采样 %4 次")
+            .arg(m_minRaw)
+            .arg(m_maxRaw)
+            .arg(m_sumRaw / std::max<qint64>(1, m_sampleCount))
+            .arg(m_sampleCount));
+        m_chart->setValues(m_history);
+
+        if (m_mode == Mode::Threshold)
+            applyThresholdMode();
+        else if (m_mode == Mode::AdcBlink)
+            applyBlinkSpeed();
+
+        if (onAdcChanged)
+            onAdcChanged(m_currentRaw);
+    }
+
+    void applyThresholdMode()
+    {
+        const int threshold = m_thresholdSlider->value();
+        const bool active = m_currentRaw >= threshold;
+        setLed(active);
+        m_modeLabel->setText(QString::fromUtf8("模式：阈值联动，ADC %1 %2 %3，LED %4")
+            .arg(m_currentRaw)
+            .arg(active ? QString::fromUtf8("≥") : QString::fromUtf8("<"))
+            .arg(threshold)
+            .arg(active ? QString::fromUtf8("亮") : QString::fromUtf8("灭")));
+    }
+
+    void applyBlinkSpeed()
+    {
+        const int newPeriod = 1200 - 1120 * m_currentRaw / 8191;
+        if (std::abs(newPeriod - m_blinkHalfPeriodMs) >= 10) {
+            m_blinkHalfPeriodMs = newPeriod;
+            if (m_blinkTimer.isActive())
+                m_blinkTimer.setInterval(m_blinkHalfPeriodMs);
+        }
+        m_modeLabel->setText(QString::fromUtf8("模式：ADC 调速闪烁，半周期 %1 ms")
+            .arg(m_blinkHalfPeriodMs));
+    }
+
+    void updateThresholdLabel()
+    {
+        const int value = m_thresholdSlider->value();
+        m_thresholdLabel->setText(QString::fromUtf8("触摸设置阈值：%1（%2 mV）")
+            .arg(value)
+            .arg(value * m_scaleMillivolts, 0, 'f', 1));
+    }
+
+    void resetStatistics()
+    {
+        m_history.clear();
+        m_filterWindow.clear();
+        m_sampleCount = 0;
+        m_sumRaw = 0;
+        m_minRaw = 0;
+        m_maxRaw = 0;
+        m_chart->setValues(m_history);
+    }
+
+    void refreshModeButtons()
+    {
+        for (const auto &entry : m_modeButtons) {
+            entry.second->setProperty("active", entry.first == m_mode);
+            entry.second->style()->unpolish(entry.second);
+            entry.second->style()->polish(entry.second);
+        }
+    }
+
+    QString m_ledRoot;
+    QString m_iioRoot;
+    QString m_originalTrigger;
+    QString m_originalBrightness;
+    QLabel *m_valueLabel = nullptr;
+    QLabel *m_statisticsLabel = nullptr;
+    QLabel *m_thresholdLabel = nullptr;
+    QLabel *m_modeLabel = nullptr;
+    QLabel *m_errorLabel = nullptr;
+    QSlider *m_thresholdSlider = nullptr;
+    LineChart *m_chart = nullptr;
+    QVector<QPair<Mode, QPushButton *>> m_modeButtons;
+    QVector<int> m_history;
+    QVector<int> m_filterWindow;
+    QTimer m_adcTimer;
+    QTimer m_blinkTimer;
+    Mode m_mode = Mode::Observe;
+    qint64 m_sumRaw = 0;
+    qint64 m_sampleCount = 0;
+    int m_minRaw = 0;
+    int m_maxRaw = 0;
+    int m_currentRaw = 0;
+    int m_blinkHalfPeriodMs = 600;
+    double m_scaleMillivolts = 0.219726562;
+    bool m_hardwareReady = false;
+    bool m_ledReady = false;
+    bool m_ledClaimed = false;
+    bool m_ledOn = false;
+    bool m_readOnly = false;
+};
+
+class TouchCanvas final : public QWidget
+{
+public:
+    explicit TouchCanvas(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        setAttribute(Qt::WA_AcceptTouchEvents);
+        setMinimumHeight(650);
+        setMouseTracking(true);
+    }
+
+    std::function<void(const QMap<int, QPointF> &, int)> onPointsChanged;
+
+    void clearCanvas()
+    {
+        m_active.clear();
+        m_trails.clear();
+        m_maxContacts = 0;
+        notify();
+        update();
+    }
+
+protected:
+    bool event(QEvent *event) override
+    {
+        if (event->type() == QEvent::TouchBegin
+            || event->type() == QEvent::TouchUpdate
+            || event->type() == QEvent::TouchEnd) {
+            auto *touch = static_cast<QTouchEvent *>(event);
+            for (const QTouchEvent::TouchPoint &point : touch->touchPoints()) {
+                const int id = point.id();
+                if (point.state() == Qt::TouchPointReleased) {
+                    appendTrail(id, point.pos());
+                    m_active.remove(id);
+                } else {
+                    m_active[id] = point.pos();
+                    if (point.state() != Qt::TouchPointStationary)
+                        appendTrail(id, point.pos());
+                }
+            }
+            if (event->type() == QEvent::TouchEnd)
+                m_active.clear();
+            m_maxContacts = std::max(m_maxContacts, m_active.size());
+            notify();
+            update();
+            event->accept();
+            return true;
+        }
+        return QWidget::event(event);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        m_active[0] = event->localPos();
+        appendTrail(0, event->localPos());
+        m_maxContacts = std::max(m_maxContacts, 1);
+        notify();
+        update();
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        if (!(event->buttons() & Qt::LeftButton))
+            return;
+        m_active[0] = event->localPos();
+        appendTrail(0, event->localPos());
+        notify();
+        update();
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        appendTrail(0, event->localPos());
+        m_active.remove(0);
+        notify();
+        update();
+    }
+
+    void paintEvent(QPaintEvent *) override
+    {
+        static const QVector<QColor> colors = {
+            QColor(QStringLiteral("#38bdf8")), QColor(QStringLiteral("#fb7185")),
+            QColor(QStringLiteral("#4ade80")), QColor(QStringLiteral("#fbbf24")),
+            QColor(QStringLiteral("#c084fc"))
+        };
+
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.fillRect(rect(), QColor(QStringLiteral("#08111f")));
+
+        painter.setPen(QPen(QColor(QStringLiteral("#1e3046")), 1));
+        for (int x = 0; x < width(); x += 80)
+            painter.drawLine(x, 0, x, height());
+        for (int y = 0; y < height(); y += 80)
+            painter.drawLine(0, y, width(), y);
+
+        for (auto it = m_trails.cbegin(); it != m_trails.cend(); ++it) {
+            const QColor color = colors.at(std::abs(it.key()) % colors.size());
+            painter.setPen(QPen(color, 5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            const QVector<QPointF> &trail = it.value();
+            for (int i = 1; i < trail.size(); ++i)
+                painter.drawLine(trail.at(i - 1), trail.at(i));
+        }
+
+        QFont idFont = painter.font();
+        idFont.setPixelSize(28);
+        idFont.setBold(true);
+        painter.setFont(idFont);
+        for (auto it = m_active.cbegin(); it != m_active.cend(); ++it) {
+            const QColor color = colors.at(std::abs(it.key()) % colors.size());
+            painter.setBrush(QColor(color.red(), color.green(), color.blue(), 105));
+            painter.setPen(QPen(color, 5));
+            painter.drawEllipse(it.value(), 45, 45);
+            painter.setPen(Qt::white);
+            painter.drawText(QRectF(it.value().x() - 45, it.value().y() - 45, 90, 90),
+                Qt::AlignCenter, QString::number(it.key() + 1));
+        }
+
+        if (m_active.isEmpty() && m_trails.isEmpty()) {
+            painter.setPen(QColor(QStringLiteral("#8fa6bf")));
+            QFont hintFont = painter.font();
+            hintFont.setPixelSize(26);
+            hintFont.setBold(false);
+            painter.setFont(hintFont);
+            painter.drawText(rect().adjusted(40, 40, -40, -40), Qt::AlignCenter,
+                QString::fromUtf8("请用 1～5 根手指同时触摸并移动\n不同编号会显示不同颜色的轨迹"));
+        }
+    }
+
+private:
+    void appendTrail(int id, const QPointF &point)
+    {
+        QVector<QPointF> &trail = m_trails[id];
+        trail.append(point);
+        if (trail.size() > 100)
+            trail.remove(0, trail.size() - 100);
+    }
+
+    void notify()
+    {
+        if (onPointsChanged)
+            onPointsChanged(m_active, m_maxContacts);
+    }
+
+    QMap<int, QPointF> m_active;
+    QMap<int, QVector<QPointF>> m_trails;
+    int m_maxContacts = 0;
+};
+
+class TouchPage final : public QWidget
+{
+public:
+    explicit TouchPage(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 18, 28, 24);
+        root->setSpacing(14);
+
+        auto *top = new QHBoxLayout;
+        m_statusLabel = new QLabel(QString::fromUtf8("当前 0 点    本次最多 0 点"), this);
+        m_statusLabel->setObjectName(QStringLiteral("statusText"));
+        auto *clearButton = new QPushButton(QString::fromUtf8("清除轨迹"), this);
+        clearButton->setObjectName(QStringLiteral("smallButton"));
+        top->addWidget(m_statusLabel, 1);
+        top->addWidget(clearButton);
+        root->addLayout(top);
+
+        m_detailLabel = new QLabel(QString::fromUtf8("驱动能力：最多 5 个同时触点"), this);
+        m_detailLabel->setObjectName(QStringLiteral("muted"));
+        m_detailLabel->setWordWrap(true);
+        root->addWidget(m_detailLabel);
+
+        m_canvas = new TouchCanvas(this);
+        m_canvas->setObjectName(QStringLiteral("touchCanvas"));
+        root->addWidget(m_canvas, 1);
+
+        connect(clearButton, &QPushButton::clicked, m_canvas, [this]() { m_canvas->clearCanvas(); });
+        m_canvas->onPointsChanged = [this](const QMap<int, QPointF> &points, int maxContacts) {
+            m_statusLabel->setText(QString::fromUtf8("当前 %1 点    本次最多 %2 点")
+                .arg(points.size()).arg(maxContacts));
+            QStringList details;
+            for (auto it = points.cbegin(); it != points.cend(); ++it) {
+                details.append(QString::fromUtf8("%1:(%2,%3)")
+                    .arg(it.key() + 1)
+                    .arg(it.value().x(), 0, 'f', 0)
+                    .arg(it.value().y(), 0, 'f', 0));
+            }
+            if (points.size() >= 2) {
+                auto first = points.cbegin();
+                const QPointF a = first.value();
+                ++first;
+                const QPointF b = first.value();
+                const double distance = std::hypot(a.x() - b.x(), a.y() - b.y());
+                details.append(QString::fromUtf8("前两点距离:%1").arg(distance, 0, 'f', 0));
+            }
+            m_detailLabel->setText(details.isEmpty()
+                    ? QString::fromUtf8("驱动能力：最多 5 个同时触点")
+                    : details.join(QStringLiteral("    ")));
+        };
+    }
+
+private:
+    QLabel *m_statusLabel = nullptr;
+    QLabel *m_detailLabel = nullptr;
+    TouchCanvas *m_canvas = nullptr;
+};
+
+class SystemPage final : public QWidget
+{
+public:
+    explicit SystemPage(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 18, 28, 24);
+        root->setSpacing(16);
+
+        auto *identity = makePanel(this);
+        auto *identityLayout = new QVBoxLayout(identity);
+        identityLayout->setContentsMargins(20, 16, 20, 16);
+        auto *identityTitle = makeSectionTitle(QString::fromUtf8("板卡身份"), identity);
+        m_identityLabel = new QLabel(identity);
+        m_identityLabel->setObjectName(QStringLiteral("statusText"));
+        m_identityLabel->setWordWrap(true);
+        identityLayout->addWidget(identityTitle);
+        identityLayout->addWidget(m_identityLabel);
+        root->addWidget(identity);
+
+        auto *resourcePanel = makePanel(this);
+        auto *resourceLayout = new QVBoxLayout(resourcePanel);
+        resourceLayout->setContentsMargins(20, 16, 20, 16);
+        resourceLayout->setSpacing(10);
+        resourceLayout->addWidget(makeSectionTitle(QString::fromUtf8("资源占用（每秒刷新）"), resourcePanel));
+        addProgressRow(resourceLayout, QString::fromUtf8("CPU"), m_cpuValue, m_cpuProgress);
+        addProgressRow(resourceLayout, QString::fromUtf8("内存"), m_memoryValue, m_memoryProgress);
+        addProgressRow(resourceLayout, QString::fromUtf8("根分区"), m_storageValue, m_storageProgress);
+        root->addWidget(resourcePanel);
+
+        auto *statusPanel = makePanel(this);
+        auto *statusLayout = new QVBoxLayout(statusPanel);
+        statusLayout->setContentsMargins(20, 16, 20, 16);
+        statusLayout->setSpacing(10);
+        statusLayout->addWidget(makeSectionTitle(QString::fromUtf8("温度与设备"), statusPanel));
+        m_temperatureLabel = new QLabel(statusPanel);
+        m_temperatureLabel->setObjectName(QStringLiteral("largeStatus"));
+        m_deviceLabel = new QLabel(statusPanel);
+        m_deviceLabel->setObjectName(QStringLiteral("statusText"));
+        m_deviceLabel->setWordWrap(true);
+        statusLayout->addWidget(m_temperatureLabel);
+        statusLayout->addWidget(m_deviceLabel);
+        root->addWidget(statusPanel);
+        root->addStretch();
+
+        const QString model = oneLine(QStringLiteral("/proc/device-tree/model"),
+            QString::fromUtf8("Alientek RV1126B Board"));
+        const QString kernel = oneLine(QStringLiteral("/proc/sys/kernel/osrelease"));
+        const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+        m_identityLabel->setText(QString::fromUtf8("%1\nLinux %2 · ARM64 · %3 核 CPU")
+            .arg(model, kernel)
+            .arg(cores > 0 ? cores : 0));
+    }
+
+    void updateSnapshot(const SystemSnapshot &snapshot)
+    {
+        m_cpuProgress->setValue(qRound(snapshot.cpuPercent));
+        m_cpuValue->setText(QString::fromUtf8("%1%").arg(snapshot.cpuPercent, 0, 'f', 1));
+
+        m_memoryProgress->setValue(qRound(snapshot.memoryPercent));
+        m_memoryValue->setText(QString::fromUtf8("%1% · 可用 %2 / %3")
+            .arg(snapshot.memoryPercent, 0, 'f', 1)
+            .arg(formatBytes(snapshot.memoryAvailable))
+            .arg(formatBytes(snapshot.memoryTotal)));
+
+        m_storageProgress->setValue(qRound(snapshot.storagePercent));
+        m_storageValue->setText(QString::fromUtf8("%1% · 可用 %2 / %3")
+            .arg(snapshot.storagePercent, 0, 'f', 1)
+            .arg(formatBytes(snapshot.storageAvailable))
+            .arg(formatBytes(snapshot.storageTotal)));
+
+        m_temperatureLabel->setText(QString::fromUtf8("CPU %1°C    已运行 %2")
+            .arg(snapshot.temperatureC, 0, 'f', 1)
+            .arg(uptimeText(snapshot.uptimeSeconds)));
+        m_deviceLabel->setText(QString::fromUtf8("摄像头：%1    NPU：%2\n网口：%3    Wi-Fi：%4")
+            .arg(snapshot.cameraReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
+            .arg(snapshot.npuReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
+            .arg(snapshot.ethState)
+            .arg(snapshot.wifiState));
+    }
+
+private:
+    void addProgressRow(QVBoxLayout *layout, const QString &title,
+        QLabel *&value, QProgressBar *&progress)
+    {
+        auto *row = new QHBoxLayout;
+        auto *titleLabel = new QLabel(title, this);
+        titleLabel->setObjectName(QStringLiteral("statusText"));
+        value = new QLabel(QStringLiteral("--"), this);
+        value->setObjectName(QStringLiteral("muted"));
+        value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        row->addWidget(titleLabel);
+        row->addWidget(value, 1);
+        layout->addLayout(row);
+        progress = new QProgressBar(this);
+        progress->setRange(0, 100);
+        progress->setTextVisible(false);
+        layout->addWidget(progress);
+    }
+
+    QLabel *m_identityLabel = nullptr;
+    QLabel *m_cpuValue = nullptr;
+    QLabel *m_memoryValue = nullptr;
+    QLabel *m_storageValue = nullptr;
+    QLabel *m_temperatureLabel = nullptr;
+    QLabel *m_deviceLabel = nullptr;
+    QProgressBar *m_cpuProgress = nullptr;
+    QProgressBar *m_memoryProgress = nullptr;
+    QProgressBar *m_storageProgress = nullptr;
+};
+
+class HelpPage final : public QWidget
+{
+public:
+    explicit HelpPage(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(32, 24, 32, 30);
+        root->setSpacing(18);
+
+        root->addWidget(makeSectionTitle(QString::fromUtf8("第一阶段怎么向导师演示"), this));
+        auto *content = makePanel(this);
+        auto *layout = new QVBoxLayout(content);
+        layout->setContentsMargins(24, 20, 24, 20);
+        layout->setSpacing(16);
+        auto *steps = new QLabel(QString::fromUtf8(
+            "1. 系统页：展示 Linux、CPU、内存、温度、摄像头与 NPU 状态。\n\n"
+            "2. IO / ADC 页：旋转蓝色电位器，观察原始值、电压、滤波值和曲线；"
+            "拖动阈值并演示 LED 联动，再切换 ADC 调速闪烁。\n\n"
+            "3. 五点触摸页：先单指画轨迹，再逐步增加到五指，展示独立编号、坐标和距离。\n\n"
+            "4. 返回主页并退出，说明程序会恢复进入前的 LED 状态。"), content);
+        steps->setObjectName(QStringLiteral("helpText"));
+        steps->setWordWrap(true);
+        layout->addWidget(steps);
+        root->addWidget(content, 1);
+
+        auto *note = new QLabel(QString::fromUtf8(
+            "这是运行在 Buildroot Linux 上的 ARM64 Qt5 程序，不是安卓 APK。"), this);
+        note->setObjectName(QStringLiteral("notice"));
+        note->setAlignment(Qt::AlignCenter);
+        note->setWordWrap(true);
+        root->addWidget(note);
+    }
+};
+
+class MainWindow final : public QWidget
+{
+public:
+    MainWindow()
+    {
+        setWindowTitle(QString::fromUtf8("RV1126B 触摸实验台"));
+        setWindowFlags(Qt::FramelessWindowHint);
+        setupStyle();
+        setupUi();
+
+        m_previousCpu = readCpuCounters();
+        updateSystem();
+        connect(&m_systemTimer, &QTimer::timeout, this, [this]() { updateSystem(); });
+        m_systemTimer.start(1000);
+    }
+
+    void openPageForTest(int index)
+    {
+        showPage(index);
+    }
+
+protected:
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (event->key() == Qt::Key_Back || event->key() == Qt::Key_Escape) {
+            if (m_stack->currentIndex() == 0)
+                close();
+            else
+                showPage(0);
+            return;
+        }
+        QWidget::keyPressEvent(event);
+    }
+
+private:
+    void setupUi()
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 0, 0, 0);
+        root->setSpacing(0);
+
+        auto *header = new QFrame(this);
+        header->setObjectName(QStringLiteral("header"));
+        auto *headerLayout = new QHBoxLayout(header);
+        headerLayout->setContentsMargins(18, 12, 18, 12);
+        headerLayout->setSpacing(12);
+
+        m_backButton = new QPushButton(QString::fromUtf8("‹ 主页"), header);
+        m_backButton->setObjectName(QStringLiteral("headerButton"));
+        m_backButton->setFixedWidth(118);
+        connect(m_backButton, &QPushButton::clicked, this, [this]() { showPage(0); });
+        m_titleLabel = new QLabel(QString::fromUtf8("RV1126B 实验台"), header);
+        m_titleLabel->setObjectName(QStringLiteral("headerTitle"));
+        m_titleLabel->setAlignment(Qt::AlignCenter);
+        m_titleLabel->setMinimumWidth(0);
+        m_titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        m_exitButton = new QPushButton(QString::fromUtf8("退出"), header);
+        m_exitButton->setObjectName(QStringLiteral("exitButton"));
+        m_exitButton->setFixedWidth(90);
+        connect(m_exitButton, &QPushButton::clicked, this, [this]() { close(); });
+        headerLayout->addWidget(m_backButton);
+        headerLayout->addWidget(m_titleLabel, 1);
+        headerLayout->addWidget(m_exitButton);
+        root->addWidget(header);
+
+        m_stack = new QStackedWidget(this);
+        m_stack->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        m_homePage = new HomePage(m_stack);
+        m_ioPage = new IoPage(m_stack);
+        m_touchPage = new TouchPage(m_stack);
+        m_systemPage = new SystemPage(m_stack);
+        m_helpPage = new HelpPage(m_stack);
+        m_stack->addWidget(m_homePage);
+        m_stack->addWidget(m_ioPage);
+        m_stack->addWidget(m_touchPage);
+        m_stack->addWidget(m_systemPage);
+        m_stack->addWidget(m_helpPage);
+        root->addWidget(m_stack, 1);
+
+        m_homePage->onNavigate = [this](int page) { showPage(page); };
+        m_ioPage->onAdcChanged = [this](int raw) { m_homePage->updateAdc(raw); };
+        showPage(0);
+    }
+
+    void showPage(int index)
+    {
+        if (index < 0 || index >= m_stack->count())
+            return;
+        if (m_stack->currentIndex() == 1 && index != 1)
+            m_ioPage->leavePage();
+        static const QStringList titles = {
+            QString::fromUtf8("RV1126B 实验台"),
+            QString::fromUtf8("IO / ADC 实验"),
+            QString::fromUtf8("五点触摸实验"),
+            QString::fromUtf8("系统监控"),
+            QString::fromUtf8("实验说明")
+        };
+        m_stack->setCurrentIndex(index);
+        m_titleLabel->setText(titles.value(index));
+        m_backButton->setVisible(index != 0);
+        for (QPushButton *button : { m_backButton, m_exitButton }) {
+            button->style()->unpolish(button);
+            button->style()->polish(button);
+            button->update();
+        }
+    }
+
+    void updateSystem()
+    {
+        CpuCounters current;
+        const SystemSnapshot snapshot = sampleSystem(m_previousCpu, &current);
+        if (current.valid)
+            m_previousCpu = current;
+        m_homePage->updateSystem(snapshot);
+        m_systemPage->updateSnapshot(snapshot);
+    }
+
+    void setupStyle()
+    {
+        setStyleSheet(QStringLiteral(R"(
+            QWidget {
+                background-color: #0f172a;
+                color: #f8fafc;
+            }
+            QFrame#header {
+                background-color: #111c30;
+                border-bottom: 1px solid #263449;
+            }
+            QLabel#headerTitle {
+                font-size: 30px;
+                font-weight: 700;
+                color: #e8f5ff;
+            }
+            QPushButton#headerButton, QPushButton#exitButton {
+                min-width: 116px;
+                min-height: 58px;
+                border: 1px solid #40516a;
+                border-radius: 14px;
+                background-color: #1d2a40;
+                font-size: 22px;
+                font-weight: 600;
+            }
+            QPushButton#exitButton {
+                min-width: 88px;
+                border-color: #7f3340;
+                background-color: #702b37;
+            }
+            QFrame#panel {
+                background-color: #172238;
+                border: 1px solid #2a3b54;
+                border-radius: 18px;
+            }
+            QLabel#heroTitle {
+                font-size: 38px;
+                font-weight: 750;
+                color: #7dd3fc;
+            }
+            QLabel#sectionTitle {
+                font-size: 27px;
+                font-weight: 700;
+                color: #7dd3fc;
+            }
+            QLabel#metricTitle, QLabel#muted {
+                font-size: 20px;
+                color: #9fb0c6;
+            }
+            QLabel#metricValue {
+                font-size: 31px;
+                font-weight: 700;
+                color: #f8fafc;
+            }
+            QLabel#statusText {
+                font-size: 22px;
+                color: #d8e2ef;
+            }
+            QLabel#largeStatus {
+                font-size: 27px;
+                font-weight: 650;
+                color: #f8fafc;
+            }
+            QLabel#adcValue {
+                font-size: 31px;
+                font-weight: 700;
+                color: #f8fafc;
+            }
+            QLabel#error {
+                font-size: 20px;
+                color: #fda4af;
+            }
+            QLabel#notice {
+                min-height: 62px;
+                padding: 8px;
+                border: 1px solid #2e7494;
+                border-radius: 14px;
+                background-color: #123249;
+                color: #bae6fd;
+                font-size: 21px;
+            }
+            QLabel#helpText {
+                font-size: 25px;
+                line-height: 1.5;
+                color: #e4edf7;
+            }
+            QPushButton#moduleButton {
+                min-height: 215px;
+                padding: 16px;
+                border: 2px solid #334b69;
+                border-radius: 22px;
+                background-color: #192a43;
+                color: #f8fafc;
+                font-size: 24px;
+                font-weight: 650;
+                text-align: left;
+            }
+            QPushButton#moduleButton:pressed {
+                background-color: #254568;
+                border-color: #38bdf8;
+            }
+            QPushButton#actionButton {
+                min-height: 78px;
+                border: 2px solid #40516a;
+                border-radius: 16px;
+                background-color: #1b2a42;
+                font-size: 21px;
+                font-weight: 600;
+            }
+            QPushButton#actionButton[active="true"] {
+                border-color: #38bdf8;
+                background-color: #075985;
+            }
+            QPushButton#smallButton {
+                min-width: 132px;
+                min-height: 58px;
+                border: 1px solid #40516a;
+                border-radius: 14px;
+                background-color: #23344d;
+                font-size: 21px;
+                font-weight: 600;
+            }
+            QPushButton:pressed {
+                background-color: #314863;
+            }
+            QProgressBar {
+                min-height: 34px;
+                border: 1px solid #33445c;
+                border-radius: 11px;
+                background-color: #0c1525;
+            }
+            QProgressBar::chunk {
+                border-radius: 10px;
+                background-color: #22a8d8;
+            }
+            QSlider {
+                min-height: 68px;
+            }
+            QSlider::groove:horizontal {
+                height: 18px;
+                border-radius: 9px;
+                background-color: #33445c;
+            }
+            QSlider::sub-page:horizontal {
+                border-radius: 9px;
+                background-color: #f59e0b;
+            }
+            QSlider::handle:horizontal {
+                width: 52px;
+                margin: -18px 0;
+                border: 4px solid #f59e0b;
+                border-radius: 26px;
+                background-color: #fff7ed;
+            }
+        )"));
+    }
+
+    QStackedWidget *m_stack = nullptr;
+    HomePage *m_homePage = nullptr;
+    IoPage *m_ioPage = nullptr;
+    TouchPage *m_touchPage = nullptr;
+    SystemPage *m_systemPage = nullptr;
+    HelpPage *m_helpPage = nullptr;
+    QPushButton *m_backButton = nullptr;
+    QPushButton *m_exitButton = nullptr;
+    QLabel *m_titleLabel = nullptr;
+    QTimer m_systemTimer;
+    CpuCounters m_previousCpu;
+};
+
+} // namespace
+
+int main(int argc, char *argv[])
+{
+    QApplication app(argc, argv);
+    app.setApplicationName(QStringLiteral("rv1126blab"));
+
+    QFont font = app.font();
+    font.setPixelSize(22);
+    app.setFont(font);
+
+    MainWindow window;
+    bool startPageOk = false;
+    const int startPage = qEnvironmentVariableIntValue("RV1126BLAB_START_PAGE", &startPageOk);
+    const QString screenshotPath = qEnvironmentVariable("RV1126BLAB_SCREENSHOT");
+    if (screenshotPath.isEmpty()) {
+        window.showFullScreen();
+    } else {
+        window.resize(720, 1280);
+        window.show();
+        QTimer::singleShot(800, &window, [&window, screenshotPath]() {
+            window.grab().save(screenshotPath, "PNG");
+        });
+    }
+    if (startPageOk) {
+        QTimer::singleShot(0, &window, [&window, startPage]() {
+            window.openPageForTest(startPage);
+        });
+    }
+
+    bool autoExitOk = false;
+    const int autoExitMs = qEnvironmentVariableIntValue("RV1126BLAB_AUTO_EXIT_MS", &autoExitOk);
+    if (autoExitOk && autoExitMs > 0)
+        QTimer::singleShot(autoExitMs, &app, &QApplication::quit);
+
+    return app.exec();
+}
