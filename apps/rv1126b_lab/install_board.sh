@@ -1,41 +1,37 @@
 #!/bin/sh
 set -eu
 
-cfg=/opt/ui/src/ATK-DLRV1126B/apk3.cfg
+launcher_dir=/opt/ui/src/ATK-DLRV1126B
+target_cfg="$launcher_dir/apk2.cfg"
 entry_file=/tmp/rv1126blab-entry.txt
-new_cfg="$cfg.new"
 
-if [ ! -f "$cfg" ] || [ ! -f "$entry_file" ]; then
+if [ ! -f "$entry_file" ]; then
     exit 10
 fi
 
-if [ ! -f "$cfg.codex-backup" ]; then
-    cp -p "$cfg" "$cfg.codex-backup"
+entry=$(awk 'NF == 3 { print; exit }' "$entry_file")
+if [ -z "$entry" ]; then
+    exit 20
 fi
 
-awk '
-    NR == FNR {
-        if (NF == 3)
-            entry = $0
-        next
-    }
-    $3 == "rv1126blab" {
-        if (!found)
-            print entry
-        found = 1
-        next
-    }
-    NF { print }
-    END {
-        if (!entry)
-            exit 20
-        if (!found)
-            print entry
-    }
-' "$entry_file" "$cfg" > "$new_cfg"
+for cfg in "$launcher_dir/apk1.cfg" "$launcher_dir/apk2.cfg" "$launcher_dir/apk3.cfg"; do
+    if [ ! -f "$cfg" ]; then
+        exit 10
+    fi
+    awk '$3 != "rv1126blab" && NF { print }' "$cfg" > "$cfg.new"
+    if [ "$cfg" = "$target_cfg" ]; then
+        printf '%s\n' "$entry" >> "$cfg.new"
+    fi
+    awk 'NF != 3 { bad = 1 } END { exit bad }' "$cfg.new"
+done
 
-awk 'NF != 3 { bad = 1 } END { exit bad }' "$new_cfg"
-chmod 0644 "$new_cfg"
-mv -f "$new_cfg" "$cfg"
+for cfg in "$launcher_dir/apk1.cfg" "$launcher_dir/apk2.cfg" "$launcher_dir/apk3.cfg"; do
+    if [ ! -f "$cfg.codex-backup" ]; then
+        cp -p "$cfg" "$cfg.codex-backup"
+    fi
+    chmod 0644 "$cfg.new"
+    mv -f "$cfg.new" "$cfg"
+done
+
 rm -f /tmp/rv1126blab-entry.txt /tmp/rv1126blab-install.sh
 sync

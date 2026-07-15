@@ -41,7 +41,7 @@ wsl -e sh -lc "cd /mnt/d/WorkSpace/RV1126B && ./apps/rv1126b_lab/build_wsl.sh"
 powershell -ExecutionPolicy Bypass -File .\apps\rv1126b_lab\install.ps1
 ```
 
-安装位置为 `/opt/ui/src/apps/rv1126blab`，桌面配置追加到 `apk3.cfg`。安装脚本不会自动重启开发板；重启后桌面会出现“RV1126B实验台”。
+安装位置为 `/opt/ui/src/apps/rv1126blab`，桌面入口追加到普通应用页 `apk2.cfg`（与 LED、按键、ADC 调速灯同页），不会占用底部 Dock 的 `apk3.cfg`。安装脚本不会自动重启开发板；重启后桌面会出现“RV1126B实验台”。
 
 ## 已完成的实机验证
 
@@ -71,6 +71,7 @@ powershell -ExecutionPolicy Bypass -File .\apps\rv1126b_lab\install.ps1
 - `RV1126BLAB_VISION_PROBE=1`：自动运行一次只读的 V4L2 格式检测；
 - `RV1126BLAB_VISION_LAUNCH_TEST=camera`：自动启动并关闭一次 `camera` 或 `aispark` 子程序；
 - `RV1126BLAB_HARDWARE_TAB=key`：测试时直接打开板载物理按键子页。
+- `RV1126BLAB_EXIT_TEST=1`：模拟点击“返回桌面”按钮并验证进程退出；
 
 板端离屏测试示例：
 

@@ -2247,6 +2247,11 @@ public:
         m_hardwarePage->openKeyForTest();
     }
 
+    void runExitButtonTest()
+    {
+        m_exitButton->click();
+    }
+
 protected:
     void resizeEvent(QResizeEvent *event) override
     {
@@ -2262,7 +2267,7 @@ protected:
                 return;
             }
             if (m_stack->currentIndex() == 0)
-                close();
+                requestExit();
             else
                 showPage(0);
             return;
@@ -2290,10 +2295,10 @@ private:
         m_titleLabel->setAlignment(Qt::AlignCenter);
         m_titleLabel->setMinimumWidth(0);
         m_titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-        m_exitButton = new QPushButton(QString::fromUtf8("退出"), m_header);
+        m_exitButton = new QPushButton(QString::fromUtf8("返回桌面"), m_header);
         m_exitButton->setObjectName(QStringLiteral("exitButton"));
-        m_exitButton->setFixedWidth(90);
-        connect(m_exitButton, &QPushButton::clicked, this, [this]() { close(); });
+        m_exitButton->setFixedWidth(144);
+        connect(m_exitButton, &QPushButton::pressed, this, [this]() { requestExit(); });
         root->addWidget(m_header);
 
         m_stack = new QStackedWidget(this);
@@ -2336,9 +2341,9 @@ private:
     {
         if (!m_header || !m_backButton || !m_titleLabel || !m_exitButton)
             return;
-        const int right = std::max(18, m_header->width() - 108);
+        const int right = std::max(18, m_header->width() - 162);
         m_backButton->setGeometry(18, 12, 118, 60);
-        m_exitButton->setGeometry(right, 12, 90, 60);
+        m_exitButton->setGeometry(right, 12, 144, 60);
         const int titleLeft = m_backButton->isVisible() ? 148 : 18;
         m_titleLabel->setGeometry(titleLeft, 12,
             std::max(0, right - 12 - titleLeft), 60);
@@ -2369,6 +2374,14 @@ private:
             button->update();
         }
         layoutHeader();
+    }
+
+    void requestExit()
+    {
+        if (!m_exitButton->isEnabled())
+            return;
+        m_exitButton->setEnabled(false);
+        QTimer::singleShot(0, qApp, &QCoreApplication::quit);
     }
 
     void updateSystem()
@@ -2407,7 +2420,7 @@ private:
                 font-weight: 600;
             }
             QPushButton#exitButton {
-                min-width: 88px;
+                min-width: 142px;
                 border-color: #7f3340;
                 background-color: #702b37;
             }
@@ -2612,6 +2625,11 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariable("RV1126BLAB_HARDWARE_TAB") == QStringLiteral("key")) {
         QTimer::singleShot(100, &window, [&window]() {
             window.openHardwareKeyForTest();
+        });
+    }
+    if (qEnvironmentVariableIsSet("RV1126BLAB_EXIT_TEST")) {
+        QTimer::singleShot(500, &window, [&window]() {
+            window.runExitButtonTest();
         });
     }
 
