@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $binary = Join-Path $repoRoot "build\rv1126b-lab\rv1126blab"
 $entryFile = Join-Path $PSScriptRoot "desktop-entry.txt"
+$adcEntryFile = Join-Path $repoRoot "apps\adc_led_touch\desktop-entry.txt"
 $boardInstaller = Join-Path $PSScriptRoot "install_board.sh"
 $remoteBinary = "/opt/ui/src/apps/rv1126blab"
 
@@ -18,6 +19,9 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to upload the application." }
 
 & adb push $entryFile "/tmp/rv1126blab-entry.txt"
 if ($LASTEXITCODE -ne 0) { throw "Failed to upload the launcher entry." }
+
+& adb push $adcEntryFile "/tmp/adcled-entry.txt"
+if ($LASTEXITCODE -ne 0) { throw "Failed to upload the ADC LED launcher entry." }
 
 & adb push $boardInstaller "/tmp/rv1126blab-install.sh"
 if ($LASTEXITCODE -ne 0) { throw "Failed to upload the board installer." }

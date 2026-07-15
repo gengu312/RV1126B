@@ -29,5 +29,7 @@ build/adc-led-touch/adcled
 
 桌面启动项使用系统已有的 LED 图标，不覆盖正点原子的原 LED 应用。
 
-桌面启动配置行保存在 `desktop-entry.txt`。安装时应先备份开发板的
-`/opt/ui/src/ATK-DLRV1126B/apk2.cfg`，再以幂等方式追加该配置行。
+桌面启动配置行保存在 `desktop-entry.txt`。综合实验台安装器会在检测到
+`/opt/ui/src/apps/adcled` 后，将该入口幂等地放到第一页 `apk1.cfg` 的
+第 13 个位置，也就是原有 12 个图标下方的第一个空白格。第二页的第 5 个
+位置会被厂商清理模块覆盖，因此不再使用。
