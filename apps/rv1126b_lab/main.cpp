@@ -21,7 +21,9 @@
 #include <QPushButton>
 #include <QPixmap>
 #include <QRegularExpression>
+#include <QResizeEvent>
 #include <QSaveFile>
+#include <QScreen>
 #include <QSlider>
 #include <QSizePolicy>
 #include <QStackedWidget>
@@ -35,6 +37,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <fcntl.h>
+#include <linux/input.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -310,8 +314,10 @@ public:
             QString::fromUtf8("录音、波形、音量、回放"), 1, 1, 4);
         addModuleButton(grid, QString::fromUtf8("摄像头 / AI"),
             QString::fromUtf8("IMX415、NPU、YOLO"), 2, 0, 5);
+        addModuleButton(grid, QString::fromUtf8("总线 / 按键"),
+            QString::fromUtf8("I2C、UART、CAN、PWM、输入"), 2, 1, 6);
         addModuleButton(grid, QString::fromUtf8("实验说明"),
-            QString::fromUtf8("当前阶段的演示与验收内容"), 2, 1, 6);
+            QString::fromUtf8("当前阶段的演示与验收内容"), 3, 0, 7, 1, 2);
         root->addLayout(grid, 1);
 
         auto *status = makePanel(this);
@@ -365,6 +371,8 @@ private:
     {
         auto *button = new QPushButton(QString::fromUtf8("%1\n%2").arg(title, detail), this);
         button->setObjectName(QStringLiteral("moduleButton"));
+        button->setMinimumWidth(0);
+        button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
         connect(button, &QPushButton::clicked, this, [this, page]() {
             if (onNavigate)
                 onNavigate(page);
@@ -1420,6 +1428,422 @@ private:
     QString m_externalDisplayName;
 };
 
+class BusPanel final : public QWidget
+{
+public:
+    explicit BusPanel(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 12, 0, 0);
+        root->setSpacing(14);
+
+        auto *grid = new QGridLayout;
+        grid->setHorizontalSpacing(14);
+        grid->setVerticalSpacing(14);
+        grid->addWidget(busCard(QStringLiteral("I2C"), m_i2cValue), 0, 0);
+        grid->addWidget(busCard(QStringLiteral("UART"), m_uartValue), 0, 1);
+        grid->addWidget(busCard(QStringLiteral("CAN / PWM"), m_canValue), 1, 0);
+        grid->addWidget(busCard(QStringLiteral("SPI"), m_spiValue), 1, 1);
+        root->addLayout(grid);
+
+        auto *buttons = new QGridLayout;
+        buttons->setHorizontalSpacing(12);
+        buttons->setVerticalSpacing(12);
+        addDetailButton(buttons, QString::fromUtf8("I2C 适配器"), 0, 0,
+            [this]() { showI2cDetails(); });
+        addDetailButton(buttons, QString::fromUtf8("UART 节点"), 0, 1,
+            [this]() { showUartDetails(); });
+        addDetailButton(buttons, QString::fromUtf8("CAN / PWM"), 1, 0,
+            [this]() { showCanPwmDetails(); });
+        addDetailButton(buttons, QString::fromUtf8("SPI 状态"), 1, 1,
+            [this]() { showSpiDetails(); });
+        root->addLayout(buttons);
+
+        auto *detailPanel = makePanel(this);
+        auto *detailLayout = new QVBoxLayout(detailPanel);
+        detailLayout->setContentsMargins(20, 15, 20, 15);
+        detailLayout->addWidget(makeSectionTitle(QString::fromUtf8("只读诊断结果"), detailPanel));
+        m_detailLabel = new QLabel(detailPanel);
+        m_detailLabel->setObjectName(QStringLiteral("statusText"));
+        m_detailLabel->setWordWrap(true);
+        m_detailLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        m_detailLabel->setMinimumHeight(210);
+        m_detailLabel->setMinimumWidth(0);
+        m_detailLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+        detailLayout->addWidget(m_detailLabel);
+        root->addWidget(detailPanel, 1);
+
+        auto *note = new QLabel(QString::fromUtf8(
+            "本页只检查 Linux 设备节点，不主动扫描或写总线。外接模块前必须先核对 40P 针脚与 3.3V 电平。"), this);
+        note->setObjectName(QStringLiteral("notice"));
+        note->setAlignment(Qt::AlignCenter);
+        note->setWordWrap(true);
+        root->addWidget(note);
+
+        refreshSummary();
+        showI2cDetails();
+    }
+
+    void refreshSummary()
+    {
+        const QStringList i2c = deviceEntries(QStringLiteral("i2c-*"));
+        const QStringList uart = deviceEntries(QStringLiteral("ttyS*"));
+        const QStringList spi = deviceEntries(QStringLiteral("spidev*"));
+        const QStringList pwm = classEntries(QStringLiteral("/sys/class/pwm"),
+            QStringLiteral("pwmchip*"));
+        const int canCount = (QFile::exists(QStringLiteral("/sys/class/net/can0")) ? 1 : 0)
+            + (QFile::exists(QStringLiteral("/sys/class/net/can1")) ? 1 : 0);
+
+        m_i2cValue->setText(QString::fromUtf8("%1 路可见").arg(i2c.size()));
+        m_uartValue->setText(QString::fromUtf8("%1 个节点").arg(uart.size()));
+        m_canValue->setText(QString::fromUtf8("CAN %1 · PWM %2")
+            .arg(canCount).arg(pwm.size()));
+        m_spiValue->setText(spi.isEmpty()
+                ? QString::fromUtf8("当前未启用")
+                : QString::fromUtf8("%1 个节点").arg(spi.size()));
+    }
+
+private:
+    QWidget *busCard(const QString &name, QLabel *&value)
+    {
+        auto *panel = makePanel(this);
+        auto *layout = new QVBoxLayout(panel);
+        layout->setContentsMargins(16, 12, 16, 12);
+        auto *title = new QLabel(name, panel);
+        title->setObjectName(QStringLiteral("sectionTitle"));
+        value = new QLabel(QStringLiteral("--"), panel);
+        value->setObjectName(QStringLiteral("largeStatus"));
+        value->setWordWrap(true);
+        layout->addWidget(title);
+        layout->addWidget(value);
+        return panel;
+    }
+
+    void addDetailButton(QGridLayout *layout, const QString &text, int row, int column,
+        const std::function<void()> &handler)
+    {
+        auto *button = new QPushButton(text, this);
+        button->setObjectName(QStringLiteral("actionButton"));
+        connect(button, &QPushButton::clicked, this, handler);
+        layout->addWidget(button, row, column);
+    }
+
+    QStringList deviceEntries(const QString &pattern) const
+    {
+        return QDir(QStringLiteral("/dev")).entryList({ pattern },
+            QDir::Files | QDir::System | QDir::NoDotAndDotDot, QDir::Name);
+    }
+
+    QStringList classEntries(const QString &path, const QString &pattern) const
+    {
+        return QDir(path).entryList({ pattern },
+            QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    }
+
+    void showI2cDetails()
+    {
+        refreshSummary();
+        const QStringList adapters = deviceEntries(QStringLiteral("i2c-*"));
+        QStringList lines;
+        for (const QString &adapter : adapters) {
+            const QString name = oneLine(QString::fromUtf8("/sys/class/i2c-adapter/%1/name")
+                .arg(adapter), QString::fromUtf8("名称未知"));
+            lines.append(QString::fromUtf8("/dev/%1  ·  %2").arg(adapter, name));
+        }
+        lines.append(QString());
+        lines.append(QString::fromUtf8(
+            "说明：这里只列出控制器，不执行 i2cdetect 扫描，避免误触发总线上的敏感器件。"));
+        m_detailLabel->setText(lines.isEmpty()
+                ? QString::fromUtf8("未发现 I2C 适配器。") : lines.join('\n'));
+    }
+
+    void showUartDetails()
+    {
+        refreshSummary();
+        const QStringList uart = deviceEntries(QStringLiteral("ttyS*"));
+        m_detailLabel->setText(QString::fromUtf8(
+            "可见串口：%1\n\nUART5 已由当前设备树启用。真正收发前需要 3.3V USB-TTL，"
+            "并确认 TX/RX 交叉、共地和波特率；不能直接接 RS232 电平。")
+            .arg(uart.isEmpty() ? QString::fromUtf8("无")
+                                : QStringLiteral("/dev/") + uart.join(QStringLiteral("  /dev/"))));
+    }
+
+    void showCanPwmDetails()
+    {
+        refreshSummary();
+        QStringList canLines;
+        for (const QString &name : { QStringLiteral("can0"), QStringLiteral("can1") }) {
+            if (QFile::exists(QString::fromUtf8("/sys/class/net/%1").arg(name))) {
+                canLines.append(QString::fromUtf8("%1：%2")
+                    .arg(name, oneLine(QString::fromUtf8("/sys/class/net/%1/operstate")
+                        .arg(name), QString::fromUtf8("未知"))));
+            }
+        }
+        const QStringList pwm = classEntries(QStringLiteral("/sys/class/pwm"),
+            QStringLiteral("pwmchip*"));
+        m_detailLabel->setText(QString::fromUtf8(
+            "%1\nPWM 控制器：%2\n\nCAN/CAN-FD 需要外接收发器和另一端节点；"
+            "PWM 接 LED、蜂鸣器或舵机前要确认引脚复用与负载能力。")
+            .arg(canLines.isEmpty() ? QString::fromUtf8("未发现 CAN 节点")
+                                    : canLines.join('\n'))
+            .arg(pwm.isEmpty() ? QString::fromUtf8("无") : pwm.join(QStringLiteral("、"))));
+    }
+
+    void showSpiDetails()
+    {
+        refreshSummary();
+        const QStringList spi = deviceEntries(QStringLiteral("spidev*"));
+        if (spi.isEmpty()) {
+            m_detailLabel->setText(QString::fromUtf8(
+                "当前没有 /dev/spidev*。本机设备树中的 SPI1 尚未启用，因此现在不能直接做用户态 SPI 收发。\n\n"
+                "后续需要在 B 盘 SDK 中修改设备树、确认片选和 40P 复用，再重新构建固件；"
+                "这不是缺一根线或安装一个软件就能解决的问题。"));
+        } else {
+            m_detailLabel->setText(QString::fromUtf8("SPI 节点：/dev/%1")
+                .arg(spi.join(QStringLiteral("  /dev/"))));
+        }
+    }
+
+    QLabel *m_i2cValue = nullptr;
+    QLabel *m_uartValue = nullptr;
+    QLabel *m_canValue = nullptr;
+    QLabel *m_spiValue = nullptr;
+    QLabel *m_detailLabel = nullptr;
+};
+
+class KeyPanel final : public QWidget
+{
+public:
+    explicit KeyPanel(QWidget *parent = nullptr)
+        : QWidget(parent)
+        , m_devicePath(qEnvironmentVariable("RV1126BLAB_KEY_DEVICE",
+              "/dev/input/by-path/platform-adc-keys-event"))
+    {
+        setupUi();
+        openDevice();
+    }
+
+    ~KeyPanel() override
+    {
+        m_pollTimer.stop();
+        if (m_fd >= 0)
+            ::close(m_fd);
+    }
+
+private:
+    void setupUi()
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 12, 0, 0);
+        root->setSpacing(16);
+
+        auto *devicePanel = makePanel(this);
+        auto *deviceLayout = new QVBoxLayout(devicePanel);
+        deviceLayout->setContentsMargins(20, 15, 20, 15);
+        deviceLayout->addWidget(makeSectionTitle(QString::fromUtf8("adc-keys 输入设备"), devicePanel));
+        m_deviceLabel = new QLabel(devicePanel);
+        m_deviceLabel->setObjectName(QStringLiteral("statusText"));
+        m_deviceLabel->setWordWrap(true);
+        m_deviceLabel->setMinimumWidth(0);
+        m_deviceLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        deviceLayout->addWidget(m_deviceLabel);
+        root->addWidget(devicePanel);
+
+        auto *eventPanel = makePanel(this);
+        auto *eventLayout = new QVBoxLayout(eventPanel);
+        eventLayout->setContentsMargins(22, 20, 22, 20);
+        eventLayout->setSpacing(15);
+        m_keyLabel = new QLabel(QString::fromUtf8("等待按下板载按键"), eventPanel);
+        m_keyLabel->setObjectName(QStringLiteral("keyValue"));
+        m_keyLabel->setAlignment(Qt::AlignCenter);
+        m_stateLabel = new QLabel(QString::fromUtf8("当前状态：未触发"), eventPanel);
+        m_stateLabel->setObjectName(QStringLiteral("largeStatus"));
+        m_stateLabel->setAlignment(Qt::AlignCenter);
+        m_countLabel = new QLabel(QString::fromUtf8("有效按下次数：0"), eventPanel);
+        m_countLabel->setObjectName(QStringLiteral("statusText"));
+        m_countLabel->setAlignment(Qt::AlignCenter);
+        eventLayout->addWidget(m_keyLabel);
+        eventLayout->addWidget(m_stateLabel);
+        eventLayout->addWidget(m_countLabel);
+        root->addWidget(eventPanel);
+
+        auto *historyPanel = makePanel(this);
+        auto *historyLayout = new QVBoxLayout(historyPanel);
+        historyLayout->setContentsMargins(20, 15, 20, 15);
+        auto *historyHeader = new QHBoxLayout;
+        historyHeader->addWidget(makeSectionTitle(QString::fromUtf8("最近事件"), historyPanel));
+        auto *clearButton = new QPushButton(QString::fromUtf8("清零"), historyPanel);
+        clearButton->setObjectName(QStringLiteral("smallButton"));
+        connect(clearButton, &QPushButton::clicked, this, [this]() {
+            m_pressCount = 0;
+            m_history.clear();
+            m_countLabel->setText(QString::fromUtf8("有效按下次数：0"));
+            updateHistory();
+        });
+        historyHeader->addStretch();
+        historyHeader->addWidget(clearButton);
+        m_historyLabel = new QLabel(QString::fromUtf8("暂无事件"), historyPanel);
+        m_historyLabel->setObjectName(QStringLiteral("statusText"));
+        m_historyLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        m_historyLabel->setMinimumHeight(230);
+        m_historyLabel->setWordWrap(true);
+        historyLayout->addLayout(historyHeader);
+        historyLayout->addWidget(m_historyLabel, 1);
+        root->addWidget(historyPanel, 1);
+
+        auto *note = new QLabel(QString::fromUtf8(
+            "程序只旁路读取按键事件，不独占设备；部分按键仍可能同时触发系统音量或返回动作。"), this);
+        note->setObjectName(QStringLiteral("notice"));
+        note->setAlignment(Qt::AlignCenter);
+        note->setWordWrap(true);
+        root->addWidget(note);
+    }
+
+    void openDevice()
+    {
+        const QByteArray path = QFile::encodeName(m_devicePath);
+        m_fd = ::open(path.constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (m_fd < 0) {
+            m_deviceLabel->setText(QString::fromUtf8("打开失败：%1").arg(m_devicePath));
+            m_keyLabel->setText(QString::fromUtf8("输入设备不可用"));
+            return;
+        }
+
+        const QString target = QFileInfo(m_devicePath).symLinkTarget();
+        m_deviceLabel->setText(QString::fromUtf8("已连接：%1%2\n按下开发板实体按键查看键值、动作和计数。")
+            .arg(m_devicePath)
+            .arg(target.isEmpty() ? QString() : QString::fromUtf8(" → %1").arg(target)));
+        connect(&m_pollTimer, &QTimer::timeout, this, [this]() { readEvents(); });
+        m_pollTimer.start(30);
+    }
+
+    void readEvents()
+    {
+        input_event events[16];
+        while (true) {
+            const ssize_t bytes = ::read(m_fd, events, sizeof(events));
+            if (bytes <= 0)
+                break;
+            const int count = static_cast<int>(bytes / sizeof(input_event));
+            for (int i = 0; i < count; ++i) {
+                if (events[i].type != EV_KEY)
+                    continue;
+                const int code = events[i].code;
+                const int value = events[i].value;
+                const QString name = keyName(code);
+                const QString action = value == 0 ? QString::fromUtf8("松开")
+                    : value == 1 ? QString::fromUtf8("按下") : QString::fromUtf8("长按重复");
+                if (value == 1)
+                    ++m_pressCount;
+                m_keyLabel->setText(QString::fromUtf8("%1  ·  code %2").arg(name).arg(code));
+                m_stateLabel->setText(QString::fromUtf8("当前状态：%1").arg(action));
+                m_countLabel->setText(QString::fromUtf8("有效按下次数：%1").arg(m_pressCount));
+                m_history.prepend(QString::fromUtf8("%1  %2  code=%3")
+                    .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")),
+                        action).arg(code));
+                while (m_history.size() > 8)
+                    m_history.removeLast();
+                updateHistory();
+            }
+        }
+    }
+
+    QString keyName(int code) const
+    {
+        switch (code) {
+        case KEY_ESC: return QString::fromUtf8("返回 / ESC");
+        case KEY_ENTER: return QString::fromUtf8("确认");
+        case KEY_HOME: return QString::fromUtf8("主页");
+        case KEY_MENU: return QString::fromUtf8("菜单");
+        case KEY_POWER: return QString::fromUtf8("电源");
+        case KEY_VOLUMEUP: return QString::fromUtf8("音量加");
+        case KEY_VOLUMEDOWN: return QString::fromUtf8("音量减");
+        case KEY_UP: return QString::fromUtf8("向上");
+        case KEY_DOWN: return QString::fromUtf8("向下");
+        case KEY_LEFT: return QString::fromUtf8("向左");
+        case KEY_RIGHT: return QString::fromUtf8("向右");
+        default: return QString::fromUtf8("按键");
+        }
+    }
+
+    void updateHistory()
+    {
+        m_historyLabel->setText(m_history.isEmpty()
+                ? QString::fromUtf8("暂无事件") : m_history.join('\n'));
+    }
+
+    QString m_devicePath;
+    QLabel *m_deviceLabel = nullptr;
+    QLabel *m_keyLabel = nullptr;
+    QLabel *m_stateLabel = nullptr;
+    QLabel *m_countLabel = nullptr;
+    QLabel *m_historyLabel = nullptr;
+    QStringList m_history;
+    QTimer m_pollTimer;
+    int m_fd = -1;
+    int m_pressCount = 0;
+};
+
+class HardwarePage final : public QWidget
+{
+public:
+    explicit HardwarePage(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 14, 28, 24);
+        root->setSpacing(12);
+
+        auto *switches = new QHBoxLayout;
+        m_busButton = new QPushButton(QString::fromUtf8("总线与扩展接口"), this);
+        m_keyButton = new QPushButton(QString::fromUtf8("板载物理按键"), this);
+        for (QPushButton *button : { m_busButton, m_keyButton })
+            button->setObjectName(QStringLiteral("actionButton"));
+        switches->addWidget(m_busButton);
+        switches->addWidget(m_keyButton);
+        root->addLayout(switches);
+
+        m_stack = new QStackedWidget(this);
+        m_stack->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        m_busPanel = new BusPanel(m_stack);
+        m_keyPanel = new KeyPanel(m_stack);
+        m_stack->addWidget(m_busPanel);
+        m_stack->addWidget(m_keyPanel);
+        root->addWidget(m_stack, 1);
+
+        connect(m_busButton, &QPushButton::clicked, this, [this]() { showTab(0); });
+        connect(m_keyButton, &QPushButton::clicked, this, [this]() { showTab(1); });
+        showTab(0);
+    }
+
+    void openKeyForTest()
+    {
+        showTab(1);
+    }
+
+private:
+    void showTab(int index)
+    {
+        m_stack->setCurrentIndex(index);
+        m_busButton->setProperty("active", index == 0);
+        m_keyButton->setProperty("active", index == 1);
+        for (QPushButton *button : { m_busButton, m_keyButton }) {
+            button->style()->unpolish(button);
+            button->style()->polish(button);
+            button->update();
+        }
+        if (index == 0)
+            m_busPanel->refreshSummary();
+    }
+
+    QStackedWidget *m_stack = nullptr;
+    BusPanel *m_busPanel = nullptr;
+    KeyPanel *m_keyPanel = nullptr;
+    QPushButton *m_busButton = nullptr;
+    QPushButton *m_keyButton = nullptr;
+};
+
 class TouchCanvas final : public QWidget
 {
 public:
@@ -1762,7 +2186,8 @@ public:
             "3. 五点触摸页：先单指画轨迹，再逐步增加到五指，展示独立编号、坐标和距离。\n\n"
             "4. 音频页：录制一段语音，观察音量和波形，停止后触摸回放。\n\n"
             "5. 摄像头 / AI 页：读取 IMX415 格式，分别启动官方相机和 AiSpark 演示。\n\n"
-            "6. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
+            "6. 总线 / 按键页：查看 I2C、UART、CAN、PWM、SPI 状态，再按实体按键观察事件。\n\n"
+            "7. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
         steps->setObjectName(QStringLiteral("helpText"));
         steps->setWordWrap(true);
         layout->addWidget(steps);
@@ -1816,10 +2241,26 @@ public:
         m_visionPage->runAutomatedLaunch(binaryName, durationMs);
     }
 
+    void openHardwareKeyForTest()
+    {
+        showPage(6);
+        m_hardwarePage->openKeyForTest();
+    }
+
 protected:
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QWidget::resizeEvent(event);
+        layoutHeader();
+    }
+
     void keyPressEvent(QKeyEvent *event) override
     {
         if (event->key() == Qt::Key_Back || event->key() == Qt::Key_Escape) {
+            if (m_stack->currentIndex() == 6) {
+                event->accept();
+                return;
+            }
             if (m_stack->currentIndex() == 0)
                 close();
             else
@@ -1836,29 +2277,24 @@ private:
         root->setContentsMargins(0, 0, 0, 0);
         root->setSpacing(0);
 
-        auto *header = new QFrame(this);
-        header->setObjectName(QStringLiteral("header"));
-        auto *headerLayout = new QHBoxLayout(header);
-        headerLayout->setContentsMargins(18, 12, 18, 12);
-        headerLayout->setSpacing(12);
+        m_header = new QFrame(this);
+        m_header->setObjectName(QStringLiteral("header"));
+        m_header->setFixedHeight(84);
 
-        m_backButton = new QPushButton(QString::fromUtf8("‹ 主页"), header);
+        m_backButton = new QPushButton(QString::fromUtf8("‹ 主页"), m_header);
         m_backButton->setObjectName(QStringLiteral("headerButton"));
         m_backButton->setFixedWidth(118);
         connect(m_backButton, &QPushButton::clicked, this, [this]() { showPage(0); });
-        m_titleLabel = new QLabel(QString::fromUtf8("RV1126B 实验台"), header);
+        m_titleLabel = new QLabel(QString::fromUtf8("RV1126B 实验台"), m_header);
         m_titleLabel->setObjectName(QStringLiteral("headerTitle"));
         m_titleLabel->setAlignment(Qt::AlignCenter);
         m_titleLabel->setMinimumWidth(0);
         m_titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-        m_exitButton = new QPushButton(QString::fromUtf8("退出"), header);
+        m_exitButton = new QPushButton(QString::fromUtf8("退出"), m_header);
         m_exitButton->setObjectName(QStringLiteral("exitButton"));
         m_exitButton->setFixedWidth(90);
         connect(m_exitButton, &QPushButton::clicked, this, [this]() { close(); });
-        headerLayout->addWidget(m_backButton);
-        headerLayout->addWidget(m_titleLabel, 1);
-        headerLayout->addWidget(m_exitButton);
-        root->addWidget(header);
+        root->addWidget(m_header);
 
         m_stack = new QStackedWidget(this);
         m_stack->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
@@ -1868,6 +2304,7 @@ private:
         m_systemPage = new SystemPage(m_stack);
         m_audioPage = new AudioPage(m_stack);
         m_visionPage = new VisionPage(m_stack);
+        m_hardwarePage = new HardwarePage(m_stack);
         m_helpPage = new HelpPage(m_stack);
         m_stack->addWidget(m_homePage);
         m_stack->addWidget(m_ioPage);
@@ -1875,6 +2312,7 @@ private:
         m_stack->addWidget(m_systemPage);
         m_stack->addWidget(m_audioPage);
         m_stack->addWidget(m_visionPage);
+        m_stack->addWidget(m_hardwarePage);
         m_stack->addWidget(m_helpPage);
         root->addWidget(m_stack, 1);
 
@@ -1890,7 +2328,20 @@ private:
                 activateWindow();
             }
         };
+        layoutHeader();
         showPage(0);
+    }
+
+    void layoutHeader()
+    {
+        if (!m_header || !m_backButton || !m_titleLabel || !m_exitButton)
+            return;
+        const int right = std::max(18, m_header->width() - 108);
+        m_backButton->setGeometry(18, 12, 118, 60);
+        m_exitButton->setGeometry(right, 12, 90, 60);
+        const int titleLeft = m_backButton->isVisible() ? 148 : 18;
+        m_titleLabel->setGeometry(titleLeft, 12,
+            std::max(0, right - 12 - titleLeft), 60);
     }
 
     void showPage(int index)
@@ -1906,6 +2357,7 @@ private:
             QString::fromUtf8("系统监控"),
             QString::fromUtf8("音频采集与波形"),
             QString::fromUtf8("摄像头与 AI"),
+            QString::fromUtf8("总线与板载按键"),
             QString::fromUtf8("实验说明")
         };
         m_stack->setCurrentIndex(index);
@@ -1916,6 +2368,7 @@ private:
             button->style()->polish(button);
             button->update();
         }
+        layoutHeader();
     }
 
     void updateSystem()
@@ -2015,7 +2468,7 @@ private:
                 color: #e4edf7;
             }
             QPushButton#moduleButton {
-                min-height: 156px;
+                min-height: 128px;
                 padding: 16px;
                 border: 2px solid #334b69;
                 border-radius: 22px;
@@ -2092,7 +2545,9 @@ private:
     SystemPage *m_systemPage = nullptr;
     AudioPage *m_audioPage = nullptr;
     VisionPage *m_visionPage = nullptr;
+    HardwarePage *m_hardwarePage = nullptr;
     HelpPage *m_helpPage = nullptr;
+    QFrame *m_header = nullptr;
     QPushButton *m_backButton = nullptr;
     QPushButton *m_exitButton = nullptr;
     QLabel *m_titleLabel = nullptr;
@@ -2116,9 +2571,11 @@ int main(int argc, char *argv[])
     const int startPage = qEnvironmentVariableIntValue("RV1126BLAB_START_PAGE", &startPageOk);
     const QString screenshotPath = qEnvironmentVariable("RV1126BLAB_SCREENSHOT");
     if (screenshotPath.isEmpty()) {
+        if (app.primaryScreen())
+            window.setFixedSize(app.primaryScreen()->size());
         window.showFullScreen();
     } else {
-        window.resize(720, 1280);
+        window.setFixedSize(720, 1280);
         window.show();
         QTimer::singleShot(800, &window, [&window, screenshotPath]() {
             window.grab().save(screenshotPath, "PNG");
@@ -2150,6 +2607,11 @@ int main(int argc, char *argv[])
             launchDurationOk, launchDuration]() {
             window.runVisionLaunchTest(visionLaunchTest,
                 launchDurationOk ? launchDuration : 2500);
+        });
+    }
+    if (qEnvironmentVariable("RV1126BLAB_HARDWARE_TAB") == QStringLiteral("key")) {
+        QTimer::singleShot(100, &window, [&window]() {
+            window.openHardwareKeyForTest();
         });
     }
 
