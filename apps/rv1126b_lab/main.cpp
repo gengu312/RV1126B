@@ -331,19 +331,8 @@ public:
         : QWidget(parent)
     {
         auto *root = new QVBoxLayout(this);
-        root->setContentsMargins(28, 24, 28, 26);
-        root->setSpacing(22);
-
-        auto *welcome = new QLabel(QString::fromUtf8("建议先做：IO / ADC 实验"), this);
-        welcome->setObjectName(QStringLiteral("heroTitle"));
-        welcome->setAlignment(Qt::AlignCenter);
-        root->addWidget(welcome);
-
-        auto *subtitle = new QLabel(
-            QString::fromUtf8("旋转蓝色电位器观察数据，再用 ADC 控制 LED 闪烁"), this);
-        subtitle->setObjectName(QStringLiteral("muted"));
-        subtitle->setAlignment(Qt::AlignCenter);
-        root->addWidget(subtitle);
+        root->setContentsMargins(28, 18, 28, 26);
+        root->setSpacing(18);
 
         auto *metrics = new QHBoxLayout;
         metrics->setSpacing(14);
