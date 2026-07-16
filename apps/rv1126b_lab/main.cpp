@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QDataStream>
 #include <QDir>
+#include <QDebug>
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
@@ -24,6 +25,7 @@
 #include <QResizeEvent>
 #include <QSaveFile>
 #include <QScreen>
+#include <QScrollArea>
 #include <QSlider>
 #include <QSizePolicy>
 #include <QStackedWidget>
@@ -35,10 +37,13 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cmath>
 #include <functional>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <linux/input.h>
+#include <netinet/in.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -62,8 +67,46 @@ bool writeText(const QString &path, const QByteArray &value)
 
 QString oneLine(const QString &path, const QString &fallback = QString::fromUtf8("未知"))
 {
-    const QString value = readText(path).trimmed();
+    QString value = readText(path);
+    value.remove(QChar('\0'));
+    value = value.trimmed();
     return value.isEmpty() ? fallback : value;
+}
+
+QString ipv4Address(const QString &interfaceName)
+{
+    ifaddrs *addresses = nullptr;
+    if (getifaddrs(&addresses) != 0)
+        return {};
+
+    QString result;
+    for (ifaddrs *item = addresses; item; item = item->ifa_next) {
+        if (!item->ifa_addr || item->ifa_addr->sa_family != AF_INET
+            || QString::fromLocal8Bit(item->ifa_name) != interfaceName) {
+            continue;
+        }
+        char buffer[INET_ADDRSTRLEN] = {};
+        const auto *address = reinterpret_cast<const sockaddr_in *>(item->ifa_addr);
+        if (inet_ntop(AF_INET, &address->sin_addr, buffer, sizeof(buffer))) {
+            result = QString::fromLatin1(buffer);
+            break;
+        }
+    }
+    freeifaddrs(addresses);
+    return result;
+}
+
+QString networkText(const QString &state, const QString &address)
+{
+    if (!address.isEmpty())
+        return address;
+    if (state == QStringLiteral("up"))
+        return QString::fromUtf8("已连接，未分配 IP");
+    if (state == QStringLiteral("down"))
+        return QString::fromUtf8("未连接");
+    if (state == QString::fromUtf8("无设备"))
+        return state;
+    return QString::fromUtf8("未连接");
 }
 
 QString formatBytes(quint64 bytes)
@@ -118,6 +161,7 @@ CpuCounters readCpuCounters()
 
 struct SystemSnapshot {
     double cpuPercent = 0.0;
+    bool cpuPercentReady = false;
     double memoryPercent = 0.0;
     double storagePercent = 0.0;
     double temperatureC = 0.0;
@@ -128,8 +172,11 @@ struct SystemSnapshot {
     qint64 uptimeSeconds = 0;
     QString ethState;
     QString wifiState;
+    QString ethAddress;
+    QString wifiAddress;
     bool cameraReady = false;
     bool npuReady = false;
+    bool bluetoothReady = false;
 };
 
 quint64 memInfoValue(const QString &name)
@@ -154,6 +201,7 @@ SystemSnapshot sampleSystem(const CpuCounters &previous, CpuCounters *current)
         const quint64 totalDelta = current->total - previous.total;
         const quint64 idleDelta = current->idle - previous.idle;
         snapshot.cpuPercent = 100.0 * (totalDelta - std::min(totalDelta, idleDelta)) / totalDelta;
+        snapshot.cpuPercentReady = true;
     }
 
     snapshot.memoryTotal = memInfoValue(QStringLiteral("MemTotal"));
@@ -191,8 +239,11 @@ SystemSnapshot sampleSystem(const CpuCounters &previous, CpuCounters *current)
         QString::fromUtf8("无设备"));
     snapshot.wifiState = oneLine(QStringLiteral("/sys/class/net/wlan0/operstate"),
         QString::fromUtf8("无设备"));
+    snapshot.ethAddress = ipv4Address(QStringLiteral("eth0"));
+    snapshot.wifiAddress = ipv4Address(QStringLiteral("wlan0"));
     snapshot.cameraReady = QFile::exists(QStringLiteral("/dev/video-camera0"));
     snapshot.npuReady = QFile::exists(QStringLiteral("/dev/rknpu"));
+    snapshot.bluetoothReady = QFile::exists(QStringLiteral("/sys/class/bluetooth/hci0"));
     return snapshot;
 }
 
@@ -283,13 +334,13 @@ public:
         root->setContentsMargins(28, 24, 28, 26);
         root->setSpacing(22);
 
-        auto *welcome = new QLabel(QString::fromUtf8("RV1126B 触摸软件实验台"), this);
+        auto *welcome = new QLabel(QString::fromUtf8("建议先做：IO / ADC 实验"), this);
         welcome->setObjectName(QStringLiteral("heroTitle"));
         welcome->setAlignment(Qt::AlignCenter);
         root->addWidget(welcome);
 
         auto *subtitle = new QLabel(
-            QString::fromUtf8("一个入口完成板卡状态、IO/ADC 和触摸实验"), this);
+            QString::fromUtf8("旋转蓝色电位器观察数据，再用 ADC 控制 LED 闪烁"), this);
         subtitle->setObjectName(QStringLiteral("muted"));
         subtitle->setAlignment(Qt::AlignCenter);
         root->addWidget(subtitle);
@@ -315,9 +366,11 @@ public:
         addModuleButton(grid, QString::fromUtf8("摄像头 / AI"),
             QString::fromUtf8("IMX415、NPU、YOLO"), 2, 0, 5);
         addModuleButton(grid, QString::fromUtf8("总线 / 按键"),
-            QString::fromUtf8("I2C、UART、CAN、PWM、输入"), 2, 1, 6);
+            QString::fromUtf8("I2C、串口、CAN、PWM"), 2, 1, 6);
+        addModuleButton(grid, QString::fromUtf8("一键自检"),
+            QString::fromUtf8("自动检查硬件与系统"), 3, 0, 8);
         addModuleButton(grid, QString::fromUtf8("实验说明"),
-            QString::fromUtf8("当前阶段的演示与验收内容"), 3, 0, 7, 1, 2);
+            QString::fromUtf8("演示顺序与验收"), 3, 1, 7);
         root->addLayout(grid, 1);
 
         auto *status = makePanel(this);
@@ -334,13 +387,17 @@ public:
 
     void updateSystem(const SystemSnapshot &snapshot)
     {
-        m_cpuLabel->setText(QString::fromUtf8("%1%").arg(snapshot.cpuPercent, 0, 'f', 0));
+        m_cpuLabel->setText(snapshot.cpuPercentReady
+                ? QString::fromUtf8("%1%").arg(snapshot.cpuPercent, 0, 'f', 0)
+                : QStringLiteral("--"));
         m_temperatureLabel->setText(QString::fromUtf8("%1°C").arg(snapshot.temperatureC, 0, 'f', 1));
-        m_deviceLabel->setText(QString::fromUtf8("摄像头 %1    NPU %2    网口 %3    Wi-Fi %4")
+        m_deviceLabel->setText(QString::fromUtf8(
+            "摄像头 %1    NPU %2    蓝牙 %3\n网口 %4    Wi-Fi %5")
             .arg(snapshot.cameraReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
             .arg(snapshot.npuReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
-            .arg(snapshot.ethState)
-            .arg(snapshot.wifiState));
+            .arg(snapshot.bluetoothReady ? QString::fromUtf8("已就绪") : QString::fromUtf8("未识别"))
+            .arg(networkText(snapshot.ethState, snapshot.ethAddress))
+            .arg(networkText(snapshot.wifiState, snapshot.wifiAddress)));
     }
 
     void updateAdc(int raw)
@@ -497,6 +554,7 @@ private:
 
         m_chart->setThreshold(m_thresholdSlider->value());
         updateThresholdLabel();
+        refreshModeButtons();
     }
 
     void inspectHardware()
@@ -524,6 +582,7 @@ private:
     {
         auto *button = new QPushButton(text, this);
         button->setObjectName(QStringLiteral("actionButton"));
+        button->setProperty("baseText", text);
         button->setProperty("active", mode == Mode::Observe);
         connect(button, &QPushButton::clicked, this, [this, mode]() { setMode(mode); });
         layout->addWidget(button, row, column, rowSpan, columnSpan);
@@ -539,6 +598,8 @@ private:
         }
 
         m_mode = mode;
+        if (mode != Mode::Threshold)
+            m_thresholdActive = false;
         switch (mode) {
         case Mode::Observe:
             restoreLed();
@@ -629,7 +690,7 @@ private:
         int filterSum = 0;
         for (int value : m_filterWindow)
             filterSum += value;
-        const int filtered = filterSum / std::max(1, m_filterWindow.size());
+        m_currentFiltered = filterSum / std::max(1, m_filterWindow.size());
 
         if (m_sampleCount == 0) {
             m_minRaw = m_currentRaw;
@@ -641,10 +702,12 @@ private:
         ++m_sampleCount;
 
         const double millivolts = m_currentRaw * m_scaleMillivolts;
-        m_valueLabel->setText(QString::fromUtf8("raw %1    %2 mV    滤波 %3")
+        m_valueLabel->setText(QString::fromUtf8(
+            "原始值 %1    平滑值 %2\n电压 %3 mV    旋钮 %4%")
             .arg(m_currentRaw)
+            .arg(m_currentFiltered)
             .arg(millivolts, 0, 'f', 1)
-            .arg(filtered));
+            .arg(100.0 * m_currentFiltered / 8191.0, 0, 'f', 1));
         m_statisticsLabel->setText(QString::fromUtf8("最小 %1    最大 %2    平均 %3    采样 %4 次")
             .arg(m_minRaw)
             .arg(m_maxRaw)
@@ -664,31 +727,41 @@ private:
     void applyThresholdMode()
     {
         const int threshold = m_thresholdSlider->value();
-        const bool active = m_currentRaw >= threshold;
-        setLed(active);
-        m_modeLabel->setText(QString::fromUtf8("模式：阈值联动，ADC %1 %2 %3，LED %4")
-            .arg(m_currentRaw)
-            .arg(active ? QString::fromUtf8("≥") : QString::fromUtf8("<"))
+        constexpr int hysteresis = 80;
+        if (m_thresholdActive) {
+            if (m_currentFiltered < threshold - hysteresis)
+                m_thresholdActive = false;
+        } else if (m_currentFiltered > threshold + hysteresis) {
+            m_thresholdActive = true;
+        }
+        setLed(m_thresholdActive);
+        m_modeLabel->setText(QString::fromUtf8(
+            "模式：阈值联动，平滑值 %1，阈值 %2（滞回 ±%3），LED %4")
+            .arg(m_currentFiltered)
             .arg(threshold)
-            .arg(active ? QString::fromUtf8("亮") : QString::fromUtf8("灭")));
+            .arg(hysteresis)
+            .arg(m_thresholdActive ? QString::fromUtf8("亮") : QString::fromUtf8("灭")));
     }
 
     void applyBlinkSpeed()
     {
-        const int newPeriod = 1200 - 1120 * m_currentRaw / 8191;
+        const int newPeriod = 1200 - 1120 * m_currentFiltered / 8191;
         if (std::abs(newPeriod - m_blinkHalfPeriodMs) >= 10) {
             m_blinkHalfPeriodMs = newPeriod;
             if (m_blinkTimer.isActive())
                 m_blinkTimer.setInterval(m_blinkHalfPeriodMs);
         }
-        m_modeLabel->setText(QString::fromUtf8("模式：ADC 调速闪烁，半周期 %1 ms")
+        const double flashesPerSecond = 1000.0 / (2.0 * m_blinkHalfPeriodMs);
+        m_modeLabel->setText(QString::fromUtf8(
+            "模式：ADC 调速闪烁，约 %1 次/秒（半周期 %2 ms）")
+            .arg(flashesPerSecond, 0, 'f', 1)
             .arg(m_blinkHalfPeriodMs));
     }
 
     void updateThresholdLabel()
     {
         const int value = m_thresholdSlider->value();
-        m_thresholdLabel->setText(QString::fromUtf8("触摸设置阈值：%1（%2 mV）")
+        m_thresholdLabel->setText(QString::fromUtf8("拖动滑块设置阈值：%1（%2 mV）")
             .arg(value)
             .arg(value * m_scaleMillivolts, 0, 'f', 1));
     }
@@ -707,7 +780,10 @@ private:
     void refreshModeButtons()
     {
         for (const auto &entry : m_modeButtons) {
-            entry.second->setProperty("active", entry.first == m_mode);
+            const bool active = entry.first == m_mode;
+            entry.second->setProperty("active", active);
+            const QString baseText = entry.second->property("baseText").toString();
+            entry.second->setText(active ? QString::fromUtf8("✓ %1").arg(baseText) : baseText);
             entry.second->style()->unpolish(entry.second);
             entry.second->style()->polish(entry.second);
         }
@@ -735,12 +811,14 @@ private:
     int m_minRaw = 0;
     int m_maxRaw = 0;
     int m_currentRaw = 0;
+    int m_currentFiltered = 0;
     int m_blinkHalfPeriodMs = 600;
     double m_scaleMillivolts = 0.219726562;
     bool m_hardwareReady = false;
     bool m_ledReady = false;
     bool m_ledClaimed = false;
     bool m_ledOn = false;
+    bool m_thresholdActive = false;
     bool m_readOnly = false;
 };
 
@@ -1212,6 +1290,7 @@ public:
                 const QString output = QString::fromUtf8(m_probe.readAllStandardOutput()).trimmed();
                 const QString error = QString::fromUtf8(m_probe.readAllStandardError()).trimmed();
                 m_probeButton->setEnabled(true);
+                m_probeButton->setText(QString::fromUtf8("检测当前格式"));
                 if (exitCode == 0 && !output.isEmpty()) {
                     m_resultLabel->setText(QString::fromUtf8("摄像头格式检测：\n%1")
                         .arg(output));
@@ -1224,6 +1303,7 @@ public:
             [this](QProcess::ProcessError error) {
                 if (error == QProcess::FailedToStart) {
                     m_probeButton->setEnabled(true);
+                    m_probeButton->setText(QString::fromUtf8("检测当前格式"));
                     m_resultLabel->setText(QString::fromUtf8("无法启动 v4l2-ctl。"));
                 }
             });
@@ -1403,6 +1483,7 @@ private:
             return;
         }
         m_probeButton->setEnabled(false);
+        m_probeButton->setText(QString::fromUtf8("检测中…"));
         m_resultLabel->setText(QString::fromUtf8("正在读取 V4L2 格式……"));
         m_probe.start(QStringLiteral("/usr/bin/v4l2-ctl"), {
             QStringLiteral("-d"), QStringLiteral("/dev/video-camera0"),
@@ -2109,8 +2190,10 @@ public:
 
     void updateSnapshot(const SystemSnapshot &snapshot)
     {
-        m_cpuProgress->setValue(qRound(snapshot.cpuPercent));
-        m_cpuValue->setText(QString::fromUtf8("%1%").arg(snapshot.cpuPercent, 0, 'f', 1));
+        m_cpuProgress->setValue(snapshot.cpuPercentReady ? qRound(snapshot.cpuPercent) : 0);
+        m_cpuValue->setText(snapshot.cpuPercentReady
+                ? QString::fromUtf8("%1%").arg(snapshot.cpuPercent, 0, 'f', 1)
+                : QStringLiteral("--"));
 
         m_memoryProgress->setValue(qRound(snapshot.memoryPercent));
         m_memoryValue->setText(QString::fromUtf8("%1% · 可用 %2 / %3")
@@ -2127,11 +2210,13 @@ public:
         m_temperatureLabel->setText(QString::fromUtf8("CPU %1°C    已运行 %2")
             .arg(snapshot.temperatureC, 0, 'f', 1)
             .arg(uptimeText(snapshot.uptimeSeconds)));
-        m_deviceLabel->setText(QString::fromUtf8("摄像头：%1    NPU：%2\n网口：%3    Wi-Fi：%4")
+        m_deviceLabel->setText(QString::fromUtf8(
+            "摄像头：%1    NPU：%2    蓝牙：%3\n网口：%4    Wi-Fi：%5")
             .arg(snapshot.cameraReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
             .arg(snapshot.npuReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
-            .arg(snapshot.ethState)
-            .arg(snapshot.wifiState));
+            .arg(snapshot.bluetoothReady ? QString::fromUtf8("已就绪") : QString::fromUtf8("未识别"))
+            .arg(networkText(snapshot.ethState, snapshot.ethAddress))
+            .arg(networkText(snapshot.wifiState, snapshot.wifiAddress)));
     }
 
 private:
@@ -2164,6 +2249,304 @@ private:
     QProgressBar *m_storageProgress = nullptr;
 };
 
+class SelfTestPage final : public QWidget
+{
+public:
+    explicit SelfTestPage(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(28, 16, 28, 18);
+        root->setSpacing(10);
+
+        auto *intro = makePanel(this);
+        auto *introLayout = new QVBoxLayout(intro);
+        introLayout->setContentsMargins(18, 12, 18, 12);
+        introLayout->setSpacing(8);
+        auto *description = new QLabel(QString::fromUtf8(
+            "只读取设备节点，不会闪灯、录音、扫描 I2C 或修改系统。"), intro);
+        description->setObjectName(QStringLiteral("muted"));
+        description->setWordWrap(true);
+        introLayout->addWidget(description);
+
+        auto *actions = new QHBoxLayout;
+        actions->setSpacing(12);
+        m_runButton = new QPushButton(QString::fromUtf8("重新检测"), intro);
+        m_runButton->setObjectName(QStringLiteral("actionButton"));
+        m_saveButton = new QPushButton(QString::fromUtf8("保存本次结果"), intro);
+        m_saveButton->setObjectName(QStringLiteral("actionButton"));
+        m_saveButton->setEnabled(false);
+        connect(m_runButton, &QPushButton::clicked, this, [this]() { runChecks(); });
+        connect(m_saveButton, &QPushButton::clicked, this, [this]() { saveReport(); });
+        actions->addWidget(m_runButton);
+        actions->addWidget(m_saveButton);
+        introLayout->addLayout(actions);
+        root->addWidget(intro);
+
+        const QStringList titles = {
+            QString::fromUtf8("IO / ADC"),
+            QString::fromUtf8("触摸与按键"),
+            QString::fromUtf8("音频设备"),
+            QString::fromUtf8("摄像头与 NPU"),
+            QString::fromUtf8("网络与无线"),
+            QString::fromUtf8("扩展总线"),
+            QString::fromUtf8("系统健康")
+        };
+        for (const QString &title : titles)
+            addResultRow(root, title);
+
+        m_summaryLabel = new QLabel(QString::fromUtf8("进入本页后会自动完成一次只读检查。"), this);
+        m_summaryLabel->setObjectName(QStringLiteral("notice"));
+        m_summaryLabel->setAlignment(Qt::AlignCenter);
+        m_summaryLabel->setWordWrap(true);
+        root->addWidget(m_summaryLabel);
+    }
+
+    void runChecks()
+    {
+        QVector<CheckResult> results;
+
+        bool rawOk = false;
+        const QString adcPath = QStringLiteral(
+            "/sys/bus/iio/devices/iio:device0/in_voltage4_raw");
+        const int adcRaw = readText(adcPath).trimmed().toInt(&rawOk);
+        const bool adcReady = QFile::exists(adcPath) && rawOk
+            && adcRaw >= 0 && adcRaw <= 8191;
+        const bool ledReady = QFile::exists(QStringLiteral("/sys/class/leds/work/trigger"))
+            && QFile::exists(QStringLiteral("/sys/class/leds/work/brightness"));
+        results.append({ adcReady && ledReady ? Level::Pass : Level::Attention,
+            QString::fromUtf8("ADC：%1    板载 LED：%2")
+                .arg(adcReady ? QString::number(adcRaw) : QString::fromUtf8("未就绪"))
+                .arg(ledReady ? QString::fromUtf8("节点可用") : QString::fromUtf8("未识别")) });
+
+        const bool touchReady = hasInputDevice(QStringLiteral("ts_goodix"));
+        const bool keyReady = hasInputDevice(QStringLiteral("adc-keys"));
+        results.append({ touchReady && keyReady ? Level::Pass : Level::Attention,
+            QString::fromUtf8("Goodix 触摸：%1    ADC 实体键：%2")
+                .arg(touchReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
+                .arg(keyReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别")) });
+
+        const bool audioCapture = QFile::exists(QStringLiteral("/dev/snd/pcmC0D0c"))
+            && QFileInfo(QStringLiteral("/usr/bin/arecord")).isExecutable();
+        const bool audioPlayback = QFile::exists(QStringLiteral("/dev/snd/pcmC0D0p"))
+            && QFileInfo(QStringLiteral("/usr/bin/aplay")).isExecutable();
+        results.append({ audioCapture && audioPlayback ? Level::Pass : Level::Attention,
+            QString::fromUtf8("ES8390 采集：%1    回放：%2")
+                .arg(audioCapture ? QString::fromUtf8("可用") : QString::fromUtf8("未就绪"))
+                .arg(audioPlayback ? QString::fromUtf8("可用") : QString::fromUtf8("未就绪")) });
+
+        const bool cameraReady = QFile::exists(QStringLiteral("/dev/video-camera0"));
+        const bool npuReady = QFile::exists(QStringLiteral("/dev/rknpu"))
+            && QFile::exists(QStringLiteral("/usr/lib/librknnrt.so"));
+        results.append({ cameraReady && npuReady ? Level::Pass : Level::Attention,
+            QString::fromUtf8("IMX415：%1    NPU / RKNN：%2")
+                .arg(cameraReady ? QString::fromUtf8("已识别") : QString::fromUtf8("未识别"))
+                .arg(npuReady ? QString::fromUtf8("可用") : QString::fromUtf8("未就绪")) });
+
+        const bool ethernetReady = QFile::exists(QStringLiteral("/sys/class/net/eth0"));
+        const bool wifiReady = QFile::exists(QStringLiteral("/sys/class/net/wlan0"))
+            || QFile::exists(QStringLiteral("/sys/class/net/wlan1"));
+        const bool bluetoothReady = QFile::exists(QStringLiteral("/sys/class/bluetooth/hci0"));
+        const QString ethAddress = ipv4Address(QStringLiteral("eth0"));
+        QString wifiAddress = ipv4Address(QStringLiteral("wlan0"));
+        if (wifiAddress.isEmpty())
+            wifiAddress = ipv4Address(QStringLiteral("wlan1"));
+        const bool networkConnected = !ethAddress.isEmpty() || !wifiAddress.isEmpty();
+        const Level networkLevel = ethernetReady && wifiReady && bluetoothReady
+            ? (networkConnected ? Level::Pass : Level::Info) : Level::Attention;
+        results.append({ networkLevel,
+            QString::fromUtf8("网口：%1    Wi-Fi：%2    蓝牙：%3")
+                .arg(ethAddress.isEmpty() ? QString::fromUtf8("未连接") : ethAddress)
+                .arg(wifiAddress.isEmpty() ? QString::fromUtf8("未连接") : wifiAddress)
+                .arg(bluetoothReady ? QString::fromUtf8("已就绪") : QString::fromUtf8("未识别")) });
+
+        const int i2cCount = entryCount(QStringLiteral("/dev"), { QStringLiteral("i2c-*") });
+        const int uartCount = entryCount(QStringLiteral("/dev"),
+            { QStringLiteral("ttyS*"), QStringLiteral("ttyFIQ*") });
+        const int canCount = entryCount(QStringLiteral("/sys/class/net"),
+            { QStringLiteral("can*") });
+        const int pwmCount = entryCount(QStringLiteral("/sys/class/pwm"),
+            { QStringLiteral("pwmchip*") });
+        const int spiCount = entryCount(QStringLiteral("/dev"),
+            { QStringLiteral("spidev*") });
+        const bool mainBusesReady = i2cCount > 0 && uartCount > 0
+            && canCount > 0 && pwmCount > 0;
+        results.append({ mainBusesReady
+                ? (spiCount > 0 ? Level::Pass : Level::Info) : Level::Attention,
+            QString::fromUtf8("I2C %1 · UART %2 · CAN %3 · PWM %4 · SPI %5")
+                .arg(i2cCount).arg(uartCount).arg(canCount).arg(pwmCount)
+                .arg(spiCount > 0 ? QString::number(spiCount) : QString::fromUtf8("未启用")) });
+
+        CpuCounters current;
+        const SystemSnapshot system = sampleSystem({}, &current);
+        const bool storageReady = system.storageAvailable >= 512ULL * 1024ULL * 1024ULL;
+        const bool temperatureReady = system.temperatureC > 0.0 && system.temperatureC < 80.0;
+        const bool clockReady = QDate::currentDate().year() >= 2024;
+        results.append({ storageReady && temperatureReady
+                ? (clockReady ? Level::Pass : Level::Info) : Level::Attention,
+            QString::fromUtf8("可用存储 %1 · CPU %2°C · 系统时钟 %3")
+                .arg(formatBytes(system.storageAvailable))
+                .arg(system.temperatureC, 0, 'f', 1)
+                .arg(clockReady ? QString::fromUtf8("正常") : QString::fromUtf8("未校准")) });
+
+        applyResults(results, system);
+    }
+
+    bool saveReport()
+    {
+        if (m_reportText.isEmpty())
+            runChecks();
+
+        const QString reportDir = qEnvironmentVariable("RV1126BLAB_REPORT_DIR",
+            QStringLiteral("/userdata/rv1126b_lab/reports"));
+        if (!QDir().mkpath(reportDir)) {
+            m_summaryLabel->setText(QString::fromUtf8("保存失败：无法创建 %1").arg(reportDir));
+            return false;
+        }
+
+        const QDateTime now = QDateTime::currentDateTime();
+        const QString stamp = now.date().year() >= 2024
+            ? now.toString(QStringLiteral("yyyyMMdd-HHmmss"))
+            : QString::fromUtf8("uptime-%1s").arg(readText(QStringLiteral("/proc/uptime"))
+                  .section(' ', 0, 0).toDouble(), 0, 'f', 0);
+        const QString pathPrefix = reportDir + QStringLiteral("/selftest-") + stamp;
+        QString path = pathPrefix + QStringLiteral(".txt");
+        for (int copy = 2; QFileInfo::exists(path); ++copy)
+            path = pathPrefix + QString::fromUtf8("-%1.txt").arg(copy);
+        const QByteArray reportBytes = m_reportText.toUtf8();
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly)
+            || file.write(reportBytes) != reportBytes.size()
+            || !file.commit()) {
+            m_summaryLabel->setText(QString::fromUtf8("保存失败：%1").arg(path));
+            return false;
+        }
+        m_summaryLabel->setText(QString::fromUtf8("结果已保存：%1").arg(path));
+        return true;
+    }
+
+private:
+    enum class Level { Pass, Info, Attention };
+
+    struct CheckResult {
+        Level level;
+        QString detail;
+    };
+
+    static int entryCount(const QString &path, const QStringList &patterns)
+    {
+        return QDir(path).entryList(patterns,
+            QDir::AllEntries | QDir::System | QDir::NoDotAndDotDot).size();
+    }
+
+    static bool hasInputDevice(const QString &expectedName)
+    {
+        const QStringList events = QDir(QStringLiteral("/sys/class/input")).entryList(
+            { QStringLiteral("event*") },
+            QDir::AllEntries | QDir::System | QDir::NoDotAndDotDot);
+        for (const QString &event : events) {
+            if (readText(QStringLiteral("/sys/class/input/") + event
+                    + QStringLiteral("/device/name")).trimmed() == expectedName) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void addResultRow(QVBoxLayout *root, const QString &title)
+    {
+        auto *panel = makePanel(this);
+        panel->setMinimumHeight(74);
+        auto *layout = new QVBoxLayout(panel);
+        layout->setContentsMargins(16, 7, 16, 7);
+        layout->setSpacing(2);
+        auto *top = new QHBoxLayout;
+        auto *titleLabel = new QLabel(title, panel);
+        titleLabel->setObjectName(QStringLiteral("checkTitle"));
+        auto *stateLabel = new QLabel(QString::fromUtf8("等待"), panel);
+        stateLabel->setObjectName(QStringLiteral("checkState"));
+        stateLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        top->addWidget(titleLabel);
+        top->addWidget(stateLabel, 1);
+        auto *detailLabel = new QLabel(QString::fromUtf8("尚未检测"), panel);
+        detailLabel->setObjectName(QStringLiteral("checkDetail"));
+        detailLabel->setWordWrap(true);
+        layout->addLayout(top);
+        layout->addWidget(detailLabel);
+        root->addWidget(panel);
+        m_stateLabels.append(stateLabel);
+        m_detailLabels.append(detailLabel);
+    }
+
+    void applyResults(const QVector<CheckResult> &results, const SystemSnapshot &system)
+    {
+        int attentionCount = 0;
+        int infoCount = 0;
+        const QStringList names = {
+            QString::fromUtf8("IO / ADC"), QString::fromUtf8("触摸与按键"),
+            QString::fromUtf8("音频设备"), QString::fromUtf8("摄像头与 NPU"),
+            QString::fromUtf8("网络与无线"), QString::fromUtf8("扩展总线"),
+            QString::fromUtf8("系统健康")
+        };
+        QStringList reportLines;
+        for (int i = 0; i < results.size() && i < m_stateLabels.size(); ++i) {
+            const CheckResult &result = results.at(i);
+            QString text;
+            QString level;
+            if (result.level == Level::Pass) {
+                text = QString::fromUtf8("正常");
+                level = QStringLiteral("pass");
+            } else if (result.level == Level::Info) {
+                text = QString::fromUtf8("可用");
+                level = QStringLiteral("info");
+                ++infoCount;
+            } else {
+                text = QString::fromUtf8("待检查");
+                level = QStringLiteral("attention");
+                ++attentionCount;
+            }
+            QLabel *state = m_stateLabels.at(i);
+            state->setText(text);
+            state->setProperty("level", level);
+            state->style()->unpolish(state);
+            state->style()->polish(state);
+            m_detailLabels.at(i)->setText(result.detail);
+            reportLines.append(QStringLiteral("[%1] %2：%3")
+                .arg(text, names.value(i), result.detail));
+        }
+
+        m_summaryLabel->setText(attentionCount == 0
+                ? QString::fromUtf8("自检完成：7 项硬件检查均可用，%1 项为未联网、未校时或未启用接口提示。")
+                      .arg(infoCount)
+                : QString::fromUtf8("自检完成：有 %1 项需要检查，建议先查看红色项目。")
+                      .arg(attentionCount));
+        m_saveButton->setEnabled(true);
+
+        const bool clockReady = QDate::currentDate().year() >= 2024;
+        const QString generated = clockReady
+            ? QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+            : QString::fromUtf8("系统时钟未校准；板卡已运行 %1")
+                  .arg(uptimeText(system.uptimeSeconds));
+        m_reportText = QString::fromUtf8(
+            "RV1126B 实验台自检报告\n"
+            "生成信息：%1\n"
+            "板卡：%2\n"
+            "内核：%3\n\n%4\n")
+            .arg(generated,
+                oneLine(QStringLiteral("/proc/device-tree/model"),
+                    QString::fromUtf8("Alientek RV1126B Board")),
+                oneLine(QStringLiteral("/proc/sys/kernel/osrelease")),
+                reportLines.join(QLatin1Char('\n')));
+    }
+
+    QPushButton *m_runButton = nullptr;
+    QPushButton *m_saveButton = nullptr;
+    QLabel *m_summaryLabel = nullptr;
+    QVector<QLabel *> m_stateLabels;
+    QVector<QLabel *> m_detailLabels;
+    QString m_reportText;
+};
+
 class HelpPage final : public QWidget
 {
 public:
@@ -2180,14 +2563,15 @@ public:
         layout->setContentsMargins(24, 20, 24, 20);
         layout->setSpacing(16);
         auto *steps = new QLabel(QString::fromUtf8(
-            "1. 系统页：展示 Linux、CPU、内存、温度、摄像头与 NPU 状态。\n\n"
-            "2. IO / ADC 页：旋转蓝色电位器，观察原始值、电压、滤波值和曲线；"
+            "1. 一键自检页：先汇总 7 类硬件状态，需要时保存纯文本结果。\n\n"
+            "2. 系统页：展示 Linux、CPU、内存、温度、摄像头与 NPU 状态。\n\n"
+            "3. IO / ADC 页：旋转蓝色电位器，观察原始值、电压、滤波值和曲线；"
             "拖动阈值并演示 LED 联动，再切换 ADC 调速闪烁。\n\n"
-            "3. 五点触摸页：先单指画轨迹，再逐步增加到五指，展示独立编号、坐标和距离。\n\n"
-            "4. 音频页：录制一段语音，观察音量和波形，停止后触摸回放。\n\n"
-            "5. 摄像头 / AI 页：读取 IMX415 格式，分别启动官方相机和 AiSpark 演示。\n\n"
-            "6. 总线 / 按键页：查看 I2C、UART、CAN、PWM、SPI 状态，再按实体按键观察事件。\n\n"
-            "7. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
+            "4. 五点触摸页：先单指画轨迹，再逐步增加到五指，展示独立编号、坐标和距离。\n\n"
+            "5. 音频页：录制一段语音，观察音量和波形，停止后触摸回放。\n\n"
+            "6. 摄像头 / AI 页：读取 IMX415 格式，分别启动官方相机和 AiSpark 演示。\n\n"
+            "7. 总线 / 按键页：查看 I2C、UART、CAN、PWM、SPI 状态，再按实体按键观察事件。\n\n"
+            "8. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
         steps->setObjectName(QStringLiteral("helpText"));
         steps->setWordWrap(true);
         layout->addWidget(steps);
@@ -2212,7 +2596,6 @@ public:
         setupStyle();
         setupUi();
 
-        m_previousCpu = readCpuCounters();
         updateSystem();
         connect(&m_systemTimer, &QTimer::timeout, this, [this]() { updateSystem(); });
         m_systemTimer.start(1000);
@@ -2252,6 +2635,41 @@ public:
         m_bottomExitButton->click();
     }
 
+    void runSelfTestSave()
+    {
+        showPage(8);
+        m_selfTestPage->saveReport();
+    }
+
+    bool runLayoutTest()
+    {
+        const int originalPage = m_stack->currentIndex();
+        bool allOkay = true;
+        for (int page = 0; page < m_stack->count(); ++page) {
+            showPage(page);
+            QApplication::processEvents();
+            const auto insideWindow = [this](QWidget *widget) {
+                if (!widget || !widget->isVisible())
+                    return true;
+                return rect().contains(QRect(widget->mapTo(this, QPoint(0, 0)), widget->size()));
+            };
+            const bool okay = insideWindow(m_header) && insideWindow(m_stack)
+                && insideWindow(m_returnBar) && insideWindow(m_backButton)
+                && insideWindow(m_exitButton) && insideWindow(m_bottomHomeButton)
+                && insideWindow(m_bottomExitButton);
+            qInfo().noquote() << QStringLiteral(
+                "LAYOUT page=%1 ok=%2 stack=%3,%4,%5,%6 footer=%7,%8,%9,%10")
+                .arg(page).arg(okay ? 1 : 0)
+                .arg(m_stack->x()).arg(m_stack->y())
+                .arg(m_stack->width()).arg(m_stack->height())
+                .arg(m_returnBar->x()).arg(m_returnBar->y())
+                .arg(m_returnBar->width()).arg(m_returnBar->height());
+            allOkay = allOkay && okay;
+        }
+        showPage(originalPage);
+        return allOkay;
+    }
+
 protected:
     void resizeEvent(QResizeEvent *event) override
     {
@@ -2276,6 +2694,20 @@ protected:
     }
 
 private:
+    QScrollArea *scrollablePage(QWidget *page)
+    {
+        page->setMinimumSize(0, 0);
+        page->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        auto *area = new QScrollArea(m_stack);
+        area->setObjectName(QStringLiteral("pageScrollArea"));
+        area->setFrameShape(QFrame::NoFrame);
+        area->setWidgetResizable(true);
+        area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        area->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        area->setWidget(page);
+        return area;
+    }
+
     void setupUi()
     {
         auto *root = new QVBoxLayout(this);
@@ -2298,7 +2730,7 @@ private:
         m_exitButton = new QPushButton(QString::fromUtf8("返回桌面"), m_header);
         m_exitButton->setObjectName(QStringLiteral("exitButton"));
         m_exitButton->setFixedWidth(144);
-        connect(m_exitButton, &QPushButton::pressed, this, [this]() { requestExit(); });
+        connect(m_exitButton, &QPushButton::clicked, this, [this]() { requestExit(); });
         root->addWidget(m_header);
 
         m_stack = new QStackedWidget(this);
@@ -2311,14 +2743,16 @@ private:
         m_visionPage = new VisionPage(m_stack);
         m_hardwarePage = new HardwarePage(m_stack);
         m_helpPage = new HelpPage(m_stack);
+        m_selfTestPage = new SelfTestPage(m_stack);
         m_stack->addWidget(m_homePage);
-        m_stack->addWidget(m_ioPage);
+        m_stack->addWidget(scrollablePage(m_ioPage));
         m_stack->addWidget(m_touchPage);
-        m_stack->addWidget(m_systemPage);
-        m_stack->addWidget(m_audioPage);
-        m_stack->addWidget(m_visionPage);
-        m_stack->addWidget(m_hardwarePage);
-        m_stack->addWidget(m_helpPage);
+        m_stack->addWidget(scrollablePage(m_systemPage));
+        m_stack->addWidget(scrollablePage(m_audioPage));
+        m_stack->addWidget(scrollablePage(m_visionPage));
+        m_stack->addWidget(scrollablePage(m_hardwarePage));
+        m_stack->addWidget(scrollablePage(m_helpPage));
+        m_stack->addWidget(scrollablePage(m_selfTestPage));
         root->addWidget(m_stack, 1);
 
         m_homePage->onNavigate = [this](int page) { showPage(page); };
@@ -2339,12 +2773,17 @@ private:
         m_returnBar->setFixedHeight(76);
         auto *returnLayout = new QHBoxLayout(m_returnBar);
         returnLayout->setContentsMargins(18, 8, 18, 8);
-        m_bottomExitButton = new QPushButton(
-            QString::fromUtf8("↑  点击或从这里上滑返回桌面"), m_returnBar);
+        returnLayout->setSpacing(12);
+        m_bottomHomeButton = new QPushButton(QString::fromUtf8("⌂  实验台主页"), m_returnBar);
+        m_bottomHomeButton->setObjectName(QStringLiteral("bottomHomeButton"));
+        connect(m_bottomHomeButton, &QPushButton::clicked,
+            this, [this]() { showPage(0); });
+        m_bottomExitButton = new QPushButton(QString::fromUtf8("返回系统桌面"), m_returnBar);
         m_bottomExitButton->setObjectName(QStringLiteral("bottomExitButton"));
-        connect(m_bottomExitButton, &QPushButton::pressed,
+        connect(m_bottomExitButton, &QPushButton::clicked,
             this, [this]() { requestExit(); });
-        returnLayout->addWidget(m_bottomExitButton);
+        returnLayout->addWidget(m_bottomHomeButton, 1);
+        returnLayout->addWidget(m_bottomExitButton, 1);
         root->addWidget(m_returnBar);
 
         layoutHeader();
@@ -2377,11 +2816,15 @@ private:
             QString::fromUtf8("音频采集与波形"),
             QString::fromUtf8("摄像头与 AI"),
             QString::fromUtf8("总线与板载按键"),
-            QString::fromUtf8("实验说明")
+            QString::fromUtf8("实验说明"),
+            QString::fromUtf8("一键自检")
         };
         m_stack->setCurrentIndex(index);
+        if (index == 8)
+            m_selfTestPage->runChecks();
         m_titleLabel->setText(titles.value(index));
         m_backButton->setVisible(index != 0);
+        m_bottomHomeButton->setEnabled(index != 0);
         for (QPushButton *button : { m_backButton, m_exitButton }) {
             button->style()->unpolish(button);
             button->style()->polish(button);
@@ -2396,9 +2839,12 @@ private:
             return;
         m_exitRequested = true;
         m_exitButton->setEnabled(false);
+        m_bottomHomeButton->setEnabled(false);
         m_bottomExitButton->setEnabled(false);
-        hide();
-        QTimer::singleShot(0, qApp, []() { QCoreApplication::exit(0); });
+        m_exitButton->setText(QString::fromUtf8("正在返回…"));
+        m_bottomExitButton->setText(QString::fromUtf8("正在返回系统桌面…"));
+        QTimer::singleShot(80, this, [this]() { hide(); });
+        QTimer::singleShot(120, qApp, []() { QCoreApplication::exit(0); });
     }
 
     void updateSystem()
@@ -2445,14 +2891,28 @@ private:
                 background-color: #111c30;
                 border-top: 1px solid #33445f;
             }
-            QPushButton#bottomExitButton {
+            QScrollArea#pageScrollArea {
+                border: none;
+                background-color: #0f172a;
+            }
+            QPushButton#bottomHomeButton, QPushButton#bottomExitButton {
                 min-height: 58px;
-                border: 2px solid #a34151;
+                border: 2px solid #40516a;
                 border-radius: 14px;
-                background-color: #702b37;
                 color: #ffffff;
-                font-size: 24px;
+                font-size: 22px;
                 font-weight: 700;
+            }
+            QPushButton#bottomHomeButton {
+                background-color: #164e63;
+                border-color: #2582a0;
+            }
+            QPushButton#bottomExitButton {
+                background-color: #702b37;
+                border-color: #a34151;
+            }
+            QPushButton#bottomHomeButton:pressed {
+                background-color: #236b82;
             }
             QPushButton#bottomExitButton:pressed {
                 background-color: #9b3d4e;
@@ -2489,6 +2949,29 @@ private:
                 font-size: 27px;
                 font-weight: 650;
                 color: #f8fafc;
+            }
+            QLabel#checkTitle {
+                font-size: 21px;
+                font-weight: 700;
+                color: #e8f5ff;
+            }
+            QLabel#checkDetail {
+                font-size: 18px;
+                color: #aebed1;
+            }
+            QLabel#checkState {
+                font-size: 20px;
+                font-weight: 700;
+                color: #94a3b8;
+            }
+            QLabel#checkState[level="pass"] {
+                color: #86efac;
+            }
+            QLabel#checkState[level="info"] {
+                color: #7dd3fc;
+            }
+            QLabel#checkState[level="attention"] {
+                color: #fda4af;
             }
             QLabel#adcValue {
                 font-size: 31px;
@@ -2552,6 +3035,11 @@ private:
             QPushButton:pressed {
                 background-color: #314863;
             }
+            QPushButton:disabled {
+                border-color: #27364a;
+                background-color: #182235;
+                color: #64748b;
+            }
             QProgressBar {
                 min-height: 34px;
                 border: 1px solid #33445c;
@@ -2593,10 +3081,12 @@ private:
     VisionPage *m_visionPage = nullptr;
     HardwarePage *m_hardwarePage = nullptr;
     HelpPage *m_helpPage = nullptr;
+    SelfTestPage *m_selfTestPage = nullptr;
     QFrame *m_header = nullptr;
     QFrame *m_returnBar = nullptr;
     QPushButton *m_backButton = nullptr;
     QPushButton *m_exitButton = nullptr;
+    QPushButton *m_bottomHomeButton = nullptr;
     QPushButton *m_bottomExitButton = nullptr;
     QLabel *m_titleLabel = nullptr;
     bool m_exitRequested = false;
@@ -2666,6 +3156,16 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIsSet("RV1126BLAB_EXIT_TEST")) {
         QTimer::singleShot(500, &window, [&window]() {
             window.runExitButtonTest();
+        });
+    }
+    if (qEnvironmentVariableIsSet("RV1126BLAB_SELF_TEST_SAVE")) {
+        QTimer::singleShot(300, &window, [&window]() {
+            window.runSelfTestSave();
+        });
+    }
+    if (qEnvironmentVariableIsSet("RV1126BLAB_LAYOUT_TEST")) {
+        QTimer::singleShot(300, &window, [&window]() {
+            QCoreApplication::exit(window.runLayoutTest() ? 0 : 30);
         });
     }
 

@@ -8,7 +8,7 @@
 
 你提到的“ATC 数据”当前暂按 **ADC（模数转换）数据** 理解；如果导师指的是其他模块，需要再修正。
 
-## 当前已确认状态（2026-07-15）
+## 当前已确认状态（2026-07-16）
 
 - Windows 已识别 USB 设备 `2207:0006 rk3xxx`，ADB 在线。
 - 可直接执行 `adb shell`，进入后为开发板 `root` 用户。
@@ -21,7 +21,7 @@
 - Goodix 触摸屏为 `/dev/input/event1`，坐标范围 `720x1280`，驱动提供 5 个同时触点。
 - 配套摄像头已确认是 `ATK-MCIMX415`；灰色 FFC 是备用主机接口，本板使用模组末端的 `2x11` 排针直插 MIPI CSI。
 - 已连接的 IMX415 能正常出图：`/dev/video-camera0 -> /dev/video31`，主通道为 `3840x2160 NV12`；另一条空闲 CSI 仍可能留下探测失败日志。
-- “RV1126B实验台”已安装到开发板桌面，集成 ADC/LED、五点触摸、系统、音频、摄像头/AI、总线和按键实验。
+- “RV1126B实验台”已安装到开发板桌面，集成 ADC/LED、五点触摸、系统、音频、摄像头/AI、总线/按键和一键自检。
 
 完整证据见 [docs/bring-up-log.md](docs/bring-up-log.md)。
 
@@ -34,7 +34,8 @@
 - CPU、内存、存储、温度与设备状态；
 - ES8390 录音、实时音量/波形、WAV 保存和回放；
 - IMX415 格式检测，以及受控启动官方相机和 AiSpark；
-- I2C、UART、CAN、PWM、SPI 只读诊断和板载按键计数。
+- I2C、UART、CAN、PWM、SPI 只读诊断和板载按键计数；
+- 一键检查 7 类硬件状态，并把结果保存到 `/userdata/rv1126b_lab/reports/`。
 
 源代码、构建、安装和安全测试方法见 [apps/rv1126b_lab/README.md](apps/rv1126b_lab/README.md)。原来的 [ADC 调速灯](apps/adc_led_touch/README.md) 仍保留为单功能入门原型。
 
