@@ -2,7 +2,6 @@
 set -eu
 
 launcher_dir=/opt/ui/src/ATK-DLRV1126B
-target_cfg="$launcher_dir/apk2.cfg"
 entry_file=/tmp/rv1126blab-entry.txt
 adc_entry_file=/tmp/adcled-entry.txt
 adc_binary=/opt/ui/src/apps/adcled
@@ -26,9 +25,7 @@ for cfg in "$launcher_dir/apk1.cfg" "$launcher_dir/apk2.cfg" "$launcher_dir/apk3
         if [ -x "$adc_binary" ]; then
             printf '%s\n' "$adc_entry" >> "$cfg.new"
         fi
-    elif [ "$cfg" = "$target_cfg" ]; then
-        printf '%s\n' "$entry" > "$cfg.new"
-        awk '$3 != "rv1126blab" && $3 != "adcled" && NF { print }' "$cfg" >> "$cfg.new"
+        printf '%s\n' "$entry" >> "$cfg.new"
     else
         awk '$3 != "rv1126blab" && $3 != "adcled" && NF { print }' "$cfg" > "$cfg.new"
     fi
