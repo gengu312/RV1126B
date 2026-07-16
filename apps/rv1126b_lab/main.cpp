@@ -369,8 +369,8 @@ public:
             QString::fromUtf8("I2C、串口、CAN、PWM"), 2, 1, 6);
         addModuleButton(grid, QString::fromUtf8("一键自检"),
             QString::fromUtf8("自动检查硬件与系统"), 3, 0, 8);
-        addModuleButton(grid, QString::fromUtf8("实验说明"),
-            QString::fromUtf8("演示顺序与验收"), 3, 1, 7);
+        addModuleButton(grid, QString::fromUtf8("使用说明"),
+            QString::fromUtf8("功能介绍与操作步骤"), 3, 1, 7);
         root->addLayout(grid, 1);
 
         auto *status = makePanel(this);
@@ -2557,21 +2557,22 @@ public:
         root->setContentsMargins(32, 24, 32, 30);
         root->setSpacing(18);
 
-        root->addWidget(makeSectionTitle(QString::fromUtf8("实验台怎么向导师演示"), this));
+        root->addWidget(makeSectionTitle(QString::fromUtf8("各功能怎么使用"), this));
         auto *content = makePanel(this);
         auto *layout = new QVBoxLayout(content);
         layout->setContentsMargins(24, 20, 24, 20);
         layout->setSpacing(16);
         auto *steps = new QLabel(QString::fromUtf8(
-            "1. 一键自检页：先汇总 7 类硬件状态，需要时保存纯文本结果。\n\n"
-            "2. 系统页：展示 Linux、CPU、内存、温度、摄像头与 NPU 状态。\n\n"
+            "1. 一键自检页：汇总 7 类硬件状态，需要时保存纯文本结果。\n\n"
+            "2. 系统页：查看 Linux、CPU、内存、温度、摄像头与 NPU 状态。\n\n"
             "3. IO / ADC 页：旋转蓝色电位器，观察原始值、电压、滤波值和曲线；"
-            "拖动阈值并演示 LED 联动，再切换 ADC 调速闪烁。\n\n"
-            "4. 五点触摸页：先单指画轨迹，再逐步增加到五指，展示独立编号、坐标和距离。\n\n"
+            "拖动阈值测试 LED 联动，再切换 ADC 调速闪烁。\n\n"
+            "4. 五点触摸页：先单指画轨迹，再逐步增加到五指，查看独立编号、坐标和距离。\n\n"
             "5. 音频页：录制一段语音，观察音量和波形，停止后触摸回放。\n\n"
-            "6. 摄像头 / AI 页：读取 IMX415 格式，分别启动官方相机和 AiSpark 演示。\n\n"
+            "6. 摄像头 / AI 页：读取 IMX415 格式，需要时分别打开官方相机和 AiSpark。\n\n"
             "7. 总线 / 按键页：查看 I2C、UART、CAN、PWM、SPI 状态，再按实体按键观察事件。\n\n"
-            "8. 返回主页并退出，说明程序会恢复进入前的 LED 与音频混音状态。"), content);
+            "8. 使用底部蓝色按钮返回实验台主页，使用红色按钮退出到系统桌面。"
+            "程序退出时会恢复进入前的 LED 与音频混音状态。"), content);
         steps->setObjectName(QStringLiteral("helpText"));
         steps->setWordWrap(true);
         layout->addWidget(steps);
@@ -2816,7 +2817,7 @@ private:
             QString::fromUtf8("音频采集与波形"),
             QString::fromUtf8("摄像头与 AI"),
             QString::fromUtf8("总线与板载按键"),
-            QString::fromUtf8("实验说明"),
+            QString::fromUtf8("使用说明"),
             QString::fromUtf8("一键自检")
         };
         m_stack->setCurrentIndex(index);
