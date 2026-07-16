@@ -26,6 +26,7 @@
 #include <QSaveFile>
 #include <QScreen>
 #include <QScrollArea>
+#include <QScroller>
 #include <QSlider>
 #include <QSizePolicy>
 #include <QStackedWidget>
@@ -450,7 +451,6 @@ public:
                 m_blinkTimer.stop();
         });
         updateAdc();
-        m_adcTimer.start(100);
     }
 
     ~IoPage() override
@@ -459,6 +459,22 @@ public:
     }
 
     std::function<void(int)> onAdcChanged;
+
+    void setActive(bool active)
+    {
+        if (active) {
+            updateAdc();
+            m_adcTimer.start(150);
+        } else {
+            m_adcTimer.stop();
+            leavePage();
+        }
+    }
+
+    int currentRaw() const
+    {
+        return m_currentRaw;
+    }
 
     void leavePage()
     {
@@ -879,30 +895,57 @@ private:
 
 class AudioPage final : public QWidget
 {
+    enum class MixerPhase { Idle, Configuring, Restoring };
+    enum class RestoreReason { None, ConfigureFailed, RecordingFinished, RecorderFailed, LeavePage };
+
+    struct MixerCommand {
+        QString program;
+        QStringList arguments;
+    };
+
 public:
     explicit AudioPage(QWidget *parent = nullptr)
         : QWidget(parent)
         , m_audioDir(qEnvironmentVariable("RV1126BLAB_AUDIO_DIR",
               "/userdata/rv1126b_lab/audio"))
+        , m_alsactlPath(qEnvironmentVariable("RV1126BLAB_ALSACTL",
+              "/usr/sbin/alsactl"))
+        , m_amixerPath(qEnvironmentVariable("RV1126BLAB_AMIXER",
+              "/usr/bin/amixer"))
     {
+        bool timeoutOk = false;
+        const int timeout = qEnvironmentVariableIntValue(
+            "RV1126BLAB_MIXER_TIMEOUT_MS", &timeoutOk);
+        if (timeoutOk)
+            m_mixerTimeoutMs = qBound(500, timeout, 5000);
         setupUi();
 
         connect(&m_recorder, &QProcess::readyReadStandardOutput, this, [this]() {
             consumeAudio(m_recorder.readAllStandardOutput());
         });
+        connect(&m_recorder, &QProcess::started, this, [this]() {
+            if (m_automatedDurationMs > 0) {
+                m_automatedStopTimer.start(m_automatedDurationMs);
+                m_automatedDurationMs = 0;
+            }
+        });
         connect(&m_recorder,
             QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
             [this](int, QProcess::ExitStatus) {
+                m_recorderKillTimer.stop();
+                m_automatedStopTimer.stop();
                 consumeAudio(m_recorder.readAllStandardOutput());
                 finishRecording();
             });
         connect(&m_recorder, &QProcess::errorOccurred, this,
             [this](QProcess::ProcessError error) {
                 if (error == QProcess::FailedToStart) {
+                    m_recorderKillTimer.stop();
+                    m_automatedStopTimer.stop();
+                    m_automatedDurationMs = 0;
                     m_recordingFinalized = true;
-                    restoreMixer();
-                    setRecordingUi(false);
-                    m_statusLabel->setText(QString::fromUtf8("录音启动失败，请检查 arecord。"));
+                    m_mixerFailure = QString::fromUtf8("录音启动失败，请检查 arecord");
+                    beginMixerRestore(RestoreReason::RecorderFailed);
                 }
             });
         connect(&m_player,
@@ -912,28 +955,132 @@ public:
                 m_statusLabel->setText(exitCode == 0
                         ? QString::fromUtf8("回放完成：%1").arg(QFileInfo(m_lastWav).fileName())
                         : QString::fromUtf8("回放失败，请检查扬声器和音量。"));
+                maybeFinishShutdown();
             });
+
+        m_mixerTimeout.setSingleShot(true);
+        m_recorderKillTimer.setSingleShot(true);
+        m_automatedStopTimer.setSingleShot(true);
+        m_shutdownTimer.setSingleShot(true);
+        connect(&m_recorderKillTimer, &QTimer::timeout, this, [this]() {
+            if (m_recorder.state() != QProcess::NotRunning)
+                m_recorder.kill();
+        });
+        connect(&m_automatedStopTimer, &QTimer::timeout, this, [this]() {
+            stopRecording();
+        });
+        connect(&m_shutdownTimer, &QTimer::timeout, this, [this]() {
+            forceShutdown();
+        });
+        connect(&m_mixerProcess,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this](int exitCode, QProcess::ExitStatus status) {
+                finishMixerCommand(!m_mixerTimedOut
+                    && status == QProcess::NormalExit && exitCode == 0,
+                    m_mixerTimedOut ? QString::fromUtf8("命令执行超时")
+                                    : m_mixerProcess.errorString());
+            });
+        connect(&m_mixerProcess, &QProcess::errorOccurred, this,
+            [this](QProcess::ProcessError error) {
+                if (error == QProcess::FailedToStart)
+                    finishMixerCommand(false, m_mixerProcess.errorString());
+            });
+        connect(&m_mixerTimeout, &QTimer::timeout, this, [this]() {
+            if (!m_mixerCommandActive)
+                return;
+            m_mixerTimedOut = true;
+            m_mixerProcess.kill();
+        });
     }
 
     ~AudioPage() override
     {
+        m_mixerTimeout.stop();
+        m_recorderKillTimer.stop();
+        m_automatedStopTimer.stop();
+        m_shutdownTimer.stop();
+        QObject::disconnect(&m_recorder, nullptr, this, nullptr);
+        QObject::disconnect(&m_player, nullptr, this, nullptr);
+        QObject::disconnect(&m_mixerProcess, nullptr, this, nullptr);
+        bool audioProcessesStopped = true;
         if (m_recorder.state() != QProcess::NotRunning) {
             m_recorder.kill();
-            m_recorder.waitForFinished(500);
+            audioProcessesStopped = m_recorder.waitForFinished(500)
+                && audioProcessesStopped;
         }
         if (m_player.state() != QProcess::NotRunning) {
             m_player.kill();
-            m_player.waitForFinished(300);
+            audioProcessesStopped = m_player.waitForFinished(300)
+                && audioProcessesStopped;
         }
-        restoreMixer();
+        if (m_mixerProcess.state() != QProcess::NotRunning) {
+            m_mixerProcess.kill();
+            audioProcessesStopped = m_mixerProcess.waitForFinished(300)
+                && audioProcessesStopped;
+        }
+        if (audioProcessesStopped && m_mixerSnapshotReady)
+            restoreMixerForShutdown();
+        else if (audioProcessesStopped && !m_mixerSnapshotReady
+            && !m_mixerState.isEmpty())
+            QFile::remove(m_mixerState);
+        else if (!audioProcessesStopped && m_mixerSnapshotReady)
+            qWarning() << "Audio process did not stop; skipped concurrent ALSA restore";
+    }
+
+    std::function<void(bool)> onAutomatedTestFinished;
+
+    void shutdown(const std::function<void()> &done)
+    {
+        if (m_shuttingDown)
+            return;
+        m_shuttingDown = true;
+        m_shutdownDone = done;
+        m_shutdownRestoreAttempted = false;
+        m_automatedTest = false;
+        m_automatedDurationMs = 0;
+        m_automatedStopTimer.stop();
+        m_cancelRecording = true;
+        m_shutdownTimer.start(4500);
+
+        if (m_player.state() != QProcess::NotRunning)
+            m_player.kill();
+        if (m_recorder.state() != QProcess::NotRunning)
+            stopRecording();
+        if (m_mixerPhase == MixerPhase::Configuring
+            && m_mixerProcess.state() != QProcess::NotRunning) {
+            m_mixerProcess.kill();
+        }
+        maybeFinishShutdown();
     }
 
     void runAutomatedTest(int durationMs)
     {
-        startRecording();
-        QTimer::singleShot(qBound(500, durationMs, 5000), this, [this]() {
+        m_automatedTest = true;
+        if (qEnvironmentVariable("RV1126BLAB_AUDIO_NO_MIXER")
+            == QStringLiteral("1")) {
+            m_statusLabel->setText(QString::fromUtf8(
+                "自动音频测试不能跳过混音保存与恢复。"));
+            finishAutomatedTest(false);
+            return;
+        }
+        m_automatedDurationMs = qBound(500, durationMs, 5000);
+        if (!startRecording()) {
+            m_automatedDurationMs = 0;
+            finishAutomatedTest(false);
+        }
+    }
+
+    void leavePage()
+    {
+        m_cancelRecording = true;
+        m_automatedDurationMs = 0;
+        m_automatedStopTimer.stop();
+        if (m_player.state() != QProcess::NotRunning)
+            m_player.kill();
+        if (m_recorder.state() != QProcess::NotRunning)
             stopRecording();
-        });
+        else if (m_mixerPhase == MixerPhase::Idle && m_mixerConfigured)
+            beginMixerRestore(RestoreReason::LeavePage);
     }
 
 private:
@@ -1005,72 +1152,300 @@ private:
         root->addWidget(safety);
     }
 
-    bool configureMixer()
+    void beginMixerConfiguration()
     {
-        if (qEnvironmentVariableIsSet("RV1126BLAB_AUDIO_NO_MIXER"))
-            return true;
+        if (qEnvironmentVariable("RV1126BLAB_AUDIO_NO_MIXER") == QStringLiteral("1")) {
+            launchRecorder();
+            return;
+        }
 
         m_mixerState = QString::fromUtf8("/tmp/rv1126blab-mixer-%1.state")
             .arg(QCoreApplication::applicationPid());
-        if (QProcess::execute(QStringLiteral("/usr/sbin/alsactl"),
+        m_mixerCommands = {
+            { m_alsactlPath,
                 { QStringLiteral("-f"), m_mixerState, QStringLiteral("store"),
-                    QStringLiteral("0") }) != 0) {
-            m_mixerState.clear();
-            return false;
+                    QStringLiteral("0") } },
+            { m_amixerPath,
+                { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                    QStringLiteral("set"), QStringLiteral("ADC OSR Volume ON"),
+                    QStringLiteral("on") } },
+            { m_amixerPath,
+                { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                    QStringLiteral("set"), QStringLiteral("ADCL"), QStringLiteral("85%") } },
+            { m_amixerPath,
+                { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                    QStringLiteral("set"), QStringLiteral("ADCL PGA"), QStringLiteral("50%") } },
+            { m_amixerPath,
+                { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                    QStringLiteral("set"), QStringLiteral("ADCR"), QStringLiteral("85%") } },
+            { m_amixerPath,
+                { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
+                    QStringLiteral("set"), QStringLiteral("ADCR PGA"), QStringLiteral("50%") } }
+        };
+        m_mixerPhase = MixerPhase::Configuring;
+        m_mixerCommandIndex = 0;
+        m_mixerSnapshotReady = false;
+        m_mixerFailure.clear();
+        m_recordButton->setEnabled(false);
+        m_stopButton->setEnabled(false);
+        m_playButton->setEnabled(false);
+        m_statusLabel->setText(QString::fromUtf8("正在准备音频设备……"));
+        startNextMixerCommand();
+    }
+
+    void beginMixerRestore(RestoreReason reason)
+    {
+        if (m_shuttingDown)
+            m_shutdownRestoreAttempted = true;
+        if (m_mixerState.isEmpty()) {
+            finishMixerRestore(true, reason);
+            return;
+        }
+        m_restoreReason = reason;
+        m_mixerCommands = {
+            { m_alsactlPath,
+                { QStringLiteral("-f"), m_mixerState, QStringLiteral("restore"),
+                    QStringLiteral("0") } }
+        };
+        m_mixerPhase = MixerPhase::Restoring;
+        m_mixerCommandIndex = 0;
+        m_recordButton->setEnabled(false);
+        m_stopButton->setEnabled(false);
+        m_playButton->setEnabled(false);
+        m_statusLabel->setText(QString::fromUtf8("正在恢复音频状态……"));
+        startNextMixerCommand();
+    }
+
+    void startNextMixerCommand()
+    {
+        if (m_mixerCommandIndex >= m_mixerCommands.size()) {
+            finishMixerSequence(true);
+            return;
+        }
+        const MixerCommand &command = m_mixerCommands.at(m_mixerCommandIndex);
+        m_mixerCommandActive = true;
+        m_mixerTimedOut = false;
+        m_mixerProcess.start(command.program, command.arguments);
+        m_mixerTimeout.start(m_mixerTimeoutMs);
+    }
+
+    void finishMixerCommand(bool success, const QString &error)
+    {
+        if (!m_mixerCommandActive)
+            return;
+        m_mixerCommandActive = false;
+        m_mixerTimeout.stop();
+        if (!success) {
+            m_mixerFailure = error.isEmpty() ? QString::fromUtf8("命令执行失败") : error;
+            finishMixerSequence(false);
+            return;
+        }
+        if (m_mixerPhase == MixerPhase::Configuring && m_mixerCommandIndex == 0)
+            m_mixerSnapshotReady = true;
+        ++m_mixerCommandIndex;
+        startNextMixerCommand();
+    }
+
+    void finishMixerSequence(bool success)
+    {
+        const MixerPhase completedPhase = m_mixerPhase;
+        const RestoreReason completedReason = m_restoreReason;
+        m_mixerPhase = MixerPhase::Idle;
+        m_mixerCommands.clear();
+        m_mixerCommandIndex = 0;
+
+        if (completedPhase == MixerPhase::Configuring) {
+            if (success) {
+                m_mixerConfigured = true;
+                if (m_cancelRecording)
+                    beginMixerRestore(RestoreReason::LeavePage);
+                else
+                    launchRecorder();
+            } else {
+                m_automatedDurationMs = 0;
+                m_automatedStopTimer.stop();
+                if (m_mixerSnapshotReady) {
+                    beginMixerRestore(RestoreReason::ConfigureFailed);
+                } else {
+                    QFile::remove(m_mixerState);
+                    m_mixerState.clear();
+                    setRecordingUi(false);
+                    m_statusLabel->setText(QString::fromUtf8("音频准备失败：%1")
+                        .arg(m_mixerFailure));
+                    finishAutomatedTest(false);
+                    maybeFinishShutdown();
+                }
+            }
+            return;
         }
 
-        const QVector<QStringList> settings = {
-            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
-                QStringLiteral("set"), QStringLiteral("ADC OSR Volume ON"),
-                QStringLiteral("on") },
-            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
-                QStringLiteral("set"), QStringLiteral("ADCL"), QStringLiteral("85%") },
-            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
-                QStringLiteral("set"), QStringLiteral("ADCL PGA"), QStringLiteral("50%") },
-            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
-                QStringLiteral("set"), QStringLiteral("ADCR"), QStringLiteral("85%") },
-            { QStringLiteral("-q"), QStringLiteral("-c"), QStringLiteral("0"),
-                QStringLiteral("set"), QStringLiteral("ADCR PGA"), QStringLiteral("50%") }
-        };
-        for (const QStringList &arguments : settings) {
-            if (QProcess::execute(QStringLiteral("/usr/bin/amixer"), arguments) != 0) {
-                restoreMixer();
-                return false;
-            }
+        if (completedPhase == MixerPhase::Restoring)
+            finishMixerRestore(success, completedReason);
+    }
+
+    void finishMixerRestore(bool success, RestoreReason reason)
+    {
+        const bool automatedOkay = success
+            && reason == RestoreReason::RecordingFinished
+            && !m_pendingSavedPath.isEmpty()
+            && QFileInfo(m_pendingSavedPath).size() > 44;
+        if (success) {
+            if (!m_mixerState.isEmpty())
+                QFile::remove(m_mixerState);
+            m_mixerState.clear();
+            m_mixerConfigured = false;
+            m_mixerSnapshotReady = false;
+        } else {
+            m_audioUnsafe = true;
         }
-        m_mixerConfigured = true;
+
+        if (!success) {
+            setRecordingUi(false);
+            m_statusLabel->setText(QString::fromUtf8(
+                "音频状态恢复失败，但主页和退出仍可使用；建议重启开发板。"));
+        } else if (reason == RestoreReason::RecordingFinished) {
+            if (m_pendingSavedPath.isEmpty()) {
+                m_statusLabel->setText(QString::fromUtf8("没有收到有效音频，未保存。"));
+            } else {
+                m_lastWav = m_pendingSavedPath;
+                m_statusLabel->setText(QString::fromUtf8("已保存：%1（%2 秒）")
+                    .arg(QFileInfo(m_lastWav).fileName())
+                    .arg(m_pcm.size() / 2.0 / 16000.0, 0, 'f', 1));
+            }
+            setRecordingUi(false);
+        } else if (reason == RestoreReason::ConfigureFailed
+            || reason == RestoreReason::RecorderFailed) {
+            setRecordingUi(false);
+            m_statusLabel->setText(QString::fromUtf8("音频准备失败：%1")
+                .arg(m_mixerFailure));
+        } else {
+            setRecordingUi(false);
+            m_statusLabel->setText(QString::fromUtf8("音频已停止，混音状态已恢复。"));
+        }
+
+        m_pendingSavedPath.clear();
+        m_restoreReason = RestoreReason::None;
+        m_cancelRecording = false;
+        if (m_automatedTest)
+            finishAutomatedTest(automatedOkay);
+        maybeFinishShutdown();
+    }
+
+    void finishAutomatedTest(bool okay)
+    {
+        if (!m_automatedTest)
+            return;
+        m_automatedTest = false;
+        m_automatedDurationMs = 0;
+        m_automatedStopTimer.stop();
+        if (onAutomatedTestFinished)
+            onAutomatedTestFinished(okay);
+    }
+
+    bool restoreMixerForShutdown()
+    {
+        if (m_mixerState.isEmpty())
+            return true;
+        QProcess restore;
+        restore.start(m_alsactlPath,
+            { QStringLiteral("-f"), m_mixerState, QStringLiteral("restore"),
+                QStringLiteral("0") });
+        if (restore.waitForStarted(250) && restore.waitForFinished(1200)
+            && restore.exitStatus() == QProcess::NormalExit && restore.exitCode() == 0) {
+            QFile::remove(m_mixerState);
+            m_mixerState.clear();
+            m_mixerConfigured = false;
+            m_mixerSnapshotReady = false;
+            return true;
+        } else if (restore.state() != QProcess::NotRunning) {
+            restore.kill();
+            restore.waitForFinished(200);
+        }
+        return false;
+    }
+
+    void maybeFinishShutdown()
+    {
+        if (!m_shuttingDown || m_forcingShutdown)
+            return;
+        if (m_recorder.state() != QProcess::NotRunning
+            || m_player.state() != QProcess::NotRunning
+            || m_mixerProcess.state() != QProcess::NotRunning
+            || m_mixerPhase != MixerPhase::Idle) {
+            return;
+        }
+        if (m_mixerSnapshotReady && !m_mixerState.isEmpty()
+            && !m_shutdownRestoreAttempted) {
+            beginMixerRestore(RestoreReason::LeavePage);
+            return;
+        }
+        if (!m_mixerSnapshotReady && !m_mixerState.isEmpty()) {
+            QFile::remove(m_mixerState);
+            m_mixerState.clear();
+        }
+        finishShutdown();
+    }
+
+    void forceShutdown()
+    {
+        if (!m_shuttingDown || m_forcingShutdown)
+            return;
+        m_forcingShutdown = true;
+        m_mixerTimeout.stop();
+        m_recorderKillTimer.stop();
+        m_automatedStopTimer.stop();
+        QObject::disconnect(&m_recorder, nullptr, this, nullptr);
+        QObject::disconnect(&m_player, nullptr, this, nullptr);
+        QObject::disconnect(&m_mixerProcess, nullptr, this, nullptr);
+
+        bool stopped = true;
+        for (QProcess *process : { &m_recorder, &m_player, &m_mixerProcess }) {
+            if (process->state() == QProcess::NotRunning)
+                continue;
+            process->kill();
+            stopped = process->waitForFinished(300) && stopped;
+        }
+        if (stopped && m_mixerSnapshotReady)
+            restoreMixerForShutdown();
+        else if (stopped && !m_mixerSnapshotReady && !m_mixerState.isEmpty()) {
+            QFile::remove(m_mixerState);
+            m_mixerState.clear();
+        } else if (!stopped) {
+            qWarning() << "Audio shutdown watchdog could not stop every process";
+        }
+        finishShutdown();
+    }
+
+    void finishShutdown()
+    {
+        m_shutdownTimer.stop();
+        const std::function<void()> done = m_shutdownDone;
+        m_shutdownDone = {};
+        if (done)
+            done();
+    }
+
+    bool startRecording()
+    {
+        if (m_recorder.state() != QProcess::NotRunning
+            || m_mixerPhase != MixerPhase::Idle || m_audioUnsafe)
+            return false;
+        if (m_player.state() != QProcess::NotRunning) {
+            m_statusLabel->setText(QString::fromUtf8("请等待当前回放结束后再录音。"));
+            return false;
+        }
+        if (!QFile::exists(QStringLiteral("/usr/bin/arecord"))) {
+            m_statusLabel->setText(QString::fromUtf8("系统中没有 arecord。"));
+            return false;
+        }
+        m_cancelRecording = false;
+        beginMixerConfiguration();
         return true;
     }
 
-    void restoreMixer()
+    void launchRecorder()
     {
-        if (!m_mixerConfigured && m_mixerState.isEmpty())
-            return;
-        if (!m_mixerState.isEmpty()) {
-            QProcess::execute(QStringLiteral("/usr/sbin/alsactl"),
-                { QStringLiteral("-f"), m_mixerState, QStringLiteral("restore"),
-                    QStringLiteral("0") });
-            QFile::remove(m_mixerState);
-        }
-        m_mixerConfigured = false;
-        m_mixerState.clear();
-    }
-
-    void startRecording()
-    {
-        if (m_recorder.state() != QProcess::NotRunning)
-            return;
-        if (m_player.state() != QProcess::NotRunning)
-            m_player.kill();
-        if (!QFile::exists(QStringLiteral("/usr/bin/arecord"))) {
-            m_statusLabel->setText(QString::fromUtf8("系统中没有 arecord。"));
-            return;
-        }
-        if (!configureMixer()) {
-            m_statusLabel->setText(QString::fromUtf8("无法保存或设置 ALSA 状态，已取消录音。"));
-            return;
-        }
-
+        m_recorderKillTimer.stop();
         m_pcm.clear();
         m_waveform->clear();
         m_level->setValue(0);
@@ -1094,10 +1469,7 @@ private:
         m_statusLabel->setText(QString::fromUtf8("正在停止并保存……"));
         m_stopButton->setEnabled(false);
         m_recorder.terminate();
-        QTimer::singleShot(800, this, [this]() {
-            if (m_recorder.state() != QProcess::NotRunning)
-                m_recorder.kill();
-        });
+        m_recorderKillTimer.start(800);
     }
 
     void consumeAudio(const QByteArray &data)
@@ -1140,22 +1512,14 @@ private:
         if (m_recordingFinalized)
             return;
         m_recordingFinalized = true;
-        setRecordingUi(false);
+        m_recordButton->setEnabled(false);
+        m_stopButton->setEnabled(false);
+        m_playButton->setEnabled(false);
 
         if (m_pcm.size() % 2 != 0)
             m_pcm.chop(1);
-        const QString savedPath = saveWav();
-        restoreMixer();
-
-        if (savedPath.isEmpty()) {
-            m_statusLabel->setText(QString::fromUtf8("没有收到有效音频，未保存。"));
-            return;
-        }
-        m_lastWav = savedPath;
-        m_playButton->setEnabled(true);
-        m_statusLabel->setText(QString::fromUtf8("已保存：%1（%2 秒）")
-            .arg(QFileInfo(savedPath).fileName())
-            .arg(m_pcm.size() / 2.0 / 16000.0, 0, 'f', 1));
+        m_pendingSavedPath = saveWav();
+        beginMixerRestore(RestoreReason::RecordingFinished);
     }
 
     QString saveWav()
@@ -1209,21 +1573,33 @@ private:
 
     void setRecordingUi(bool recording)
     {
-        m_recordButton->setEnabled(!recording);
+        const bool idle = m_mixerPhase == MixerPhase::Idle;
+        m_recordButton->setEnabled(!recording && idle && !m_audioUnsafe);
         m_stopButton->setEnabled(recording);
         if (recording)
             m_playButton->setEnabled(false);
         else
             m_playButton->setEnabled(!m_lastWav.isEmpty()
-                && m_player.state() == QProcess::NotRunning);
+                && m_player.state() == QProcess::NotRunning && idle);
     }
 
     QString m_audioDir;
+    QString m_alsactlPath;
+    QString m_amixerPath;
     QString m_lastWav;
     QString m_mixerState;
+    QString m_mixerFailure;
+    QString m_pendingSavedPath;
     QByteArray m_pcm;
     QProcess m_recorder;
     QProcess m_player;
+    QProcess m_mixerProcess;
+    QTimer m_mixerTimeout;
+    QTimer m_recorderKillTimer;
+    QTimer m_automatedStopTimer;
+    QTimer m_shutdownTimer;
+    std::function<void()> m_shutdownDone;
+    QVector<MixerCommand> m_mixerCommands;
     AudioWaveform *m_waveform = nullptr;
     QProgressBar *m_level = nullptr;
     QLabel *m_levelValue = nullptr;
@@ -1231,8 +1607,22 @@ private:
     QPushButton *m_recordButton = nullptr;
     QPushButton *m_stopButton = nullptr;
     QPushButton *m_playButton = nullptr;
+    MixerPhase m_mixerPhase = MixerPhase::Idle;
+    RestoreReason m_restoreReason = RestoreReason::None;
+    int m_mixerCommandIndex = 0;
+    int m_mixerTimeoutMs = 2500;
+    int m_automatedDurationMs = 0;
     bool m_mixerConfigured = false;
+    bool m_mixerSnapshotReady = false;
+    bool m_mixerCommandActive = false;
+    bool m_mixerTimedOut = false;
+    bool m_cancelRecording = false;
+    bool m_audioUnsafe = false;
     bool m_recordingFinalized = true;
+    bool m_automatedTest = false;
+    bool m_shuttingDown = false;
+    bool m_shutdownRestoreAttempted = false;
+    bool m_forcingShutdown = false;
     int m_recordSequence = 0;
 };
 
@@ -1242,83 +1632,168 @@ public:
     explicit VisionPage(QWidget *parent = nullptr)
         : QWidget(parent)
     {
+        bool timeoutOk = false;
+        const int timeout = qEnvironmentVariableIntValue(
+            "RV1126BLAB_EXTERNAL_TIMEOUT_MS", &timeoutOk);
+        if (timeoutOk)
+            m_externalTimeoutMs = qBound(1000, timeout, 60000);
         setupUi();
         refreshStatus();
 
+        m_externalLimitTimer.setSingleShot(true);
+        m_externalKillTimer.setSingleShot(true);
+        m_automatedWatchdog.setSingleShot(true);
+        m_probeTimeout.setSingleShot(true);
         m_external.setWorkingDirectory(QStringLiteral("/"));
         m_external.setProcessChannelMode(QProcess::ForwardedChannels);
         connect(&m_external, &QProcess::started, this, [this]() {
-            m_resultLabel->setText(QString::fromUtf8("已启动 %1；关闭子程序后会自动返回实验台。")
-                .arg(m_externalDisplayName));
+            m_externalUiHidden = true;
+            m_externalReturning = false;
+            m_externalTimedOut = false;
+            if (m_automatedLaunch)
+                m_automatedStarted = true;
+            m_resultLabel->setText(QString::fromUtf8(
+                "已启动 %1；最迟 %2 秒后自动返回实验台。")
+                .arg(m_externalDisplayName)
+                .arg((m_currentExternalTimeoutMs + 999) / 1000));
             setLaunchButtonsEnabled(false);
             if (onExternalAppActive)
                 onExternalAppActive(true);
+            m_externalLimitTimer.start(m_currentExternalTimeoutMs);
         });
         connect(&m_external,
             QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
             [this](int exitCode, QProcess::ExitStatus) {
+                m_externalLimitTimer.stop();
+                m_externalKillTimer.stop();
+                restoreExternalUi();
                 setLaunchButtonsEnabled(true);
-                m_resultLabel->setText(QString::fromUtf8("%1 已退出（返回码 %2）。")
-                    .arg(m_externalDisplayName).arg(exitCode));
-                if (onExternalAppActive)
-                    onExternalAppActive(false);
+                m_resultLabel->setText(m_externalTimedOut
+                        ? QString::fromUtf8("%1 已到安全时限并自动返回实验台。")
+                              .arg(m_externalDisplayName)
+                        : QString::fromUtf8("%1 已退出（返回码 %2）。")
+                              .arg(m_externalDisplayName).arg(exitCode));
+                m_externalReturning = false;
                 refreshStatus();
+                if (m_automatedLaunch) {
+                    const bool okay = m_automatedStarted && m_externalTimedOut
+                        && !m_externalUiHidden
+                        && m_external.state() == QProcess::NotRunning
+                        && !processNamed(m_automatedBinaryName);
+                    finishAutomatedLaunch(okay);
+                }
             });
         connect(&m_external, &QProcess::errorOccurred, this,
             [this](QProcess::ProcessError error) {
                 if (error == QProcess::FailedToStart) {
+                    m_externalLimitTimer.stop();
+                    m_externalKillTimer.stop();
+                    restoreExternalUi();
                     setLaunchButtonsEnabled(true);
                     m_resultLabel->setText(QString::fromUtf8("启动失败：%1")
                         .arg(m_external.errorString()));
+                    refreshStatus();
+                    if (m_automatedLaunch)
+                        finishAutomatedLaunch(false);
                 }
             });
+        connect(&m_externalLimitTimer, &QTimer::timeout, this, [this]() {
+            m_externalTimedOut = true;
+            beginExternalReturn(QString::fromUtf8("运行时间已到，正在返回实验台……"));
+        });
+        connect(&m_externalKillTimer, &QTimer::timeout, this, [this]() {
+            if (m_external.state() != QProcess::NotRunning)
+                m_external.kill();
+            restoreExternalUi();
+        });
+        connect(&m_automatedWatchdog, &QTimer::timeout, this, [this]() {
+            if (!m_automatedLaunch)
+                return;
+            m_externalLimitTimer.stop();
+            m_externalKillTimer.stop();
+            if (m_external.state() != QProcess::NotRunning)
+                m_external.kill();
+            restoreExternalUi();
+            m_resultLabel->setText(QString::fromUtf8(
+                "自动启动测试超过总时限，已强制返回实验台。"));
+            finishAutomatedLaunch(false);
+        });
 
         connect(&m_probe,
             QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
             [this](int exitCode, QProcess::ExitStatus) {
+                m_probeTimeout.stop();
                 const QString output = QString::fromUtf8(m_probe.readAllStandardOutput()).trimmed();
                 const QString error = QString::fromUtf8(m_probe.readAllStandardError()).trimmed();
                 m_probeButton->setEnabled(true);
                 m_probeButton->setText(QString::fromUtf8("检测当前格式"));
-                if (exitCode == 0 && !output.isEmpty()) {
+                if (m_probeTimedOut) {
+                    m_resultLabel->setText(QString::fromUtf8(
+                        "摄像头格式检测超时，已停止检测；页面仍可正常返回。"));
+                } else if (exitCode == 0 && !output.isEmpty()) {
                     m_resultLabel->setText(QString::fromUtf8("摄像头格式检测：\n%1")
                         .arg(output));
                 } else {
                     m_resultLabel->setText(QString::fromUtf8("格式检测失败：%1")
                         .arg(error.isEmpty() ? QString::fromUtf8("未知错误") : error));
                 }
+                m_probeTimedOut = false;
             });
         connect(&m_probe, &QProcess::errorOccurred, this,
             [this](QProcess::ProcessError error) {
                 if (error == QProcess::FailedToStart) {
+                    m_probeTimeout.stop();
                     m_probeButton->setEnabled(true);
                     m_probeButton->setText(QString::fromUtf8("检测当前格式"));
                     m_resultLabel->setText(QString::fromUtf8("无法启动 v4l2-ctl。"));
                 }
             });
+        connect(&m_probeTimeout, &QTimer::timeout, this, [this]() {
+            if (m_probe.state() == QProcess::NotRunning)
+                return;
+            m_probeTimedOut = true;
+            m_probe.kill();
+            m_resultLabel->setText(QString::fromUtf8(
+                "摄像头格式检测超时，正在停止；页面仍可正常返回。"));
+        });
+    }
+
+    ~VisionPage() override
+    {
+        m_externalLimitTimer.stop();
+        m_externalKillTimer.stop();
+        m_automatedWatchdog.stop();
+        m_probeTimeout.stop();
+        QObject::disconnect(&m_external, nullptr, this, nullptr);
+        QObject::disconnect(&m_probe, nullptr, this, nullptr);
+        for (QProcess *process : { &m_external, &m_probe }) {
+            if (process->state() == QProcess::NotRunning)
+                continue;
+            process->kill();
+            process->waitForFinished(500);
+        }
     }
 
     std::function<void(bool)> onExternalAppActive;
+    std::function<void(bool)> onAutomatedLaunchFinished;
 
     void runAutomatedProbe()
     {
         probeCamera();
     }
 
-    void runAutomatedLaunch(const QString &binaryName, int durationMs)
+    void runAutomatedLaunch(const QString &binaryName)
     {
         const QString displayName = binaryName == QStringLiteral("aispark")
             ? QString::fromUtf8("AiSpark") : QString::fromUtf8("官方相机");
-        launchExternal(binaryName, displayName);
-        QTimer::singleShot(qBound(1000, durationMs, 5000), this, [this]() {
-            if (m_external.state() != QProcess::NotRunning) {
-                m_external.terminate();
-                QTimer::singleShot(700, this, [this]() {
-                    if (m_external.state() != QProcess::NotRunning)
-                        m_external.kill();
-                });
-            }
-        });
+        m_automatedLaunch = true;
+        m_automatedStarted = false;
+        m_automatedBinaryName = binaryName;
+        if (!launchExternal(binaryName, displayName)) {
+            finishAutomatedLaunch(false);
+        } else {
+            m_automatedWatchdog.start(m_externalTimeoutMs + 2500);
+        }
     }
 
 private:
@@ -1342,7 +1817,8 @@ private:
         auto *cameraButtons = new QHBoxLayout;
         m_probeButton = new QPushButton(QString::fromUtf8("检测当前格式"), cameraPanel);
         m_probeButton->setObjectName(QStringLiteral("actionButton"));
-        m_cameraButton = new QPushButton(QString::fromUtf8("打开官方相机"), cameraPanel);
+        m_cameraButton = new QPushButton(QString::fromUtf8("打开官方相机（最长 %1 秒）")
+            .arg((m_externalTimeoutMs + 999) / 1000), cameraPanel);
         m_cameraButton->setObjectName(QStringLiteral("actionButton"));
         connect(m_probeButton, &QPushButton::clicked, this, [this]() { probeCamera(); });
         connect(m_cameraButton, &QPushButton::clicked, this, [this]() {
@@ -1364,7 +1840,8 @@ private:
         m_aiStatus->setMinimumWidth(0);
         m_aiStatus->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         aiLayout->addWidget(m_aiStatus);
-        m_aiButton = new QPushButton(QString::fromUtf8("打开 AiSpark（YOLO）"), aiPanel);
+        m_aiButton = new QPushButton(QString::fromUtf8("打开 AiSpark（最长 %1 秒）")
+            .arg((m_externalTimeoutMs + 999) / 1000), aiPanel);
         m_aiButton->setObjectName(QStringLiteral("actionButton"));
         connect(m_aiButton, &QPushButton::clicked, this, [this]() {
             launchExternal(QStringLiteral("aispark"), QString::fromUtf8("AiSpark"));
@@ -1377,7 +1854,7 @@ private:
         resultLayout->setContentsMargins(22, 16, 22, 16);
         resultLayout->addWidget(makeSectionTitle(QString::fromUtf8("检测与启动结果"), resultPanel));
         m_resultLabel = new QLabel(QString::fromUtf8(
-            "相机和 AI 会以独立子程序运行；实验台负责检查设备并避免重复启动。"), resultPanel);
+            "相机和 AI 会以独立子程序运行；到达安全时限后会自动结束并返回实验台。"), resultPanel);
         m_resultLabel->setObjectName(QStringLiteral("statusText"));
         m_resultLabel->setWordWrap(true);
         m_resultLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
@@ -1440,27 +1917,66 @@ private:
         return false;
     }
 
-    void launchExternal(const QString &binaryName, const QString &displayName)
+    bool launchExternal(const QString &binaryName, const QString &displayName,
+        int timeoutMs = -1)
     {
         if (m_external.state() != QProcess::NotRunning) {
             m_resultLabel->setText(QString::fromUtf8("请先关闭当前运行的 %1。")
                 .arg(m_externalDisplayName));
-            return;
+            return false;
         }
         if (processNamed(QStringLiteral("camera")) || processNamed(QStringLiteral("aispark"))) {
             m_resultLabel->setText(QString::fromUtf8(
                 "检测到相机或 AiSpark 已在运行，请先从桌面关闭它，再回来启动。"));
-            return;
+            return false;
         }
 
         const QString path = QString::fromUtf8("/opt/ui/src/apps/%1").arg(binaryName);
         if (!QFileInfo(path).isExecutable()) {
             m_resultLabel->setText(QString::fromUtf8("找不到可执行程序：%1").arg(path));
-            return;
+            return false;
         }
         m_externalDisplayName = displayName;
-        m_resultLabel->setText(QString::fromUtf8("正在启动 %1……").arg(displayName));
+        m_currentExternalTimeoutMs = timeoutMs > 0 ? timeoutMs : m_externalTimeoutMs;
+        m_resultLabel->setText(QString::fromUtf8("正在启动 %1；将保留自动返回保护……")
+            .arg(displayName));
         m_external.start(path, QStringList());
+        return true;
+    }
+
+    void finishAutomatedLaunch(bool okay)
+    {
+        if (!m_automatedLaunch)
+            return;
+        m_automatedWatchdog.stop();
+        m_automatedLaunch = false;
+        m_automatedStarted = false;
+        m_automatedBinaryName.clear();
+        if (onAutomatedLaunchFinished)
+            onAutomatedLaunchFinished(okay);
+    }
+
+    void beginExternalReturn(const QString &message)
+    {
+        if (m_externalReturning)
+            return;
+        m_externalReturning = true;
+        m_resultLabel->setText(message);
+        if (m_external.state() == QProcess::NotRunning) {
+            restoreExternalUi();
+            return;
+        }
+        m_external.terminate();
+        m_externalKillTimer.start(800);
+    }
+
+    void restoreExternalUi()
+    {
+        if (!m_externalUiHidden)
+            return;
+        m_externalUiHidden = false;
+        if (onExternalAppActive)
+            onExternalAppActive(false);
     }
 
     void probeCamera()
@@ -1474,10 +1990,12 @@ private:
         m_probeButton->setEnabled(false);
         m_probeButton->setText(QString::fromUtf8("检测中…"));
         m_resultLabel->setText(QString::fromUtf8("正在读取 V4L2 格式……"));
+        m_probeTimedOut = false;
         m_probe.start(QStringLiteral("/usr/bin/v4l2-ctl"), {
             QStringLiteral("-d"), QStringLiteral("/dev/video-camera0"),
             QStringLiteral("--get-fmt-video")
         });
+        m_probeTimeout.start(5000);
     }
 
     void setLaunchButtonsEnabled(bool enabled)
@@ -1495,7 +2013,20 @@ private:
     QPushButton *m_aiButton = nullptr;
     QProcess m_external;
     QProcess m_probe;
+    QTimer m_externalLimitTimer;
+    QTimer m_externalKillTimer;
+    QTimer m_automatedWatchdog;
+    QTimer m_probeTimeout;
     QString m_externalDisplayName;
+    QString m_automatedBinaryName;
+    int m_externalTimeoutMs = 15000;
+    int m_currentExternalTimeoutMs = 15000;
+    bool m_externalUiHidden = false;
+    bool m_externalReturning = false;
+    bool m_externalTimedOut = false;
+    bool m_probeTimedOut = false;
+    bool m_automatedLaunch = false;
+    bool m_automatedStarted = false;
 };
 
 class BusPanel final : public QWidget
@@ -1694,6 +2225,16 @@ public:
         openDevice();
     }
 
+    void setActive(bool active)
+    {
+        if (m_fd < 0)
+            return;
+        if (active)
+            m_pollTimer.start(50);
+        else
+            m_pollTimer.stop();
+    }
+
     ~KeyPanel() override
     {
         m_pollTimer.stop();
@@ -1785,13 +2326,13 @@ private:
             .arg(m_devicePath)
             .arg(target.isEmpty() ? QString() : QString::fromUtf8(" → %1").arg(target)));
         connect(&m_pollTimer, &QTimer::timeout, this, [this]() { readEvents(); });
-        m_pollTimer.start(30);
     }
 
     void readEvents()
     {
         input_event events[16];
-        while (true) {
+        int batches = 0;
+        while (batches++ < 4) {
             const ssize_t bytes = ::read(m_fd, events, sizeof(events));
             if (bytes <= 0)
                 break;
@@ -1892,6 +2433,12 @@ public:
         showTab(1);
     }
 
+    void setActive(bool active)
+    {
+        m_active = active;
+        m_keyPanel->setActive(active && m_stack->currentIndex() == 1);
+    }
+
 private:
     void showTab(int index)
     {
@@ -1905,6 +2452,7 @@ private:
         }
         if (index == 0)
             m_busPanel->refreshSummary();
+        m_keyPanel->setActive(m_active && index == 1);
     }
 
     QStackedWidget *m_stack = nullptr;
@@ -1912,6 +2460,7 @@ private:
     KeyPanel *m_keyPanel = nullptr;
     QPushButton *m_busButton = nullptr;
     QPushButton *m_keyButton = nullptr;
+    bool m_active = false;
 };
 
 class TouchCanvas final : public QWidget
@@ -1923,6 +2472,14 @@ public:
         setAttribute(Qt::WA_AcceptTouchEvents);
         setMinimumHeight(650);
         setMouseTracking(true);
+        m_refreshTimer.setSingleShot(true);
+        connect(&m_refreshTimer, &QTimer::timeout, this, [this]() {
+            if (!m_refreshPending)
+                return;
+            m_refreshPending = false;
+            notify();
+            update();
+        });
     }
 
     std::function<void(const QMap<int, QPointF> &, int)> onPointsChanged;
@@ -1932,6 +2489,8 @@ public:
         m_active.clear();
         m_trails.clear();
         m_maxContacts = 0;
+        m_refreshTimer.stop();
+        m_refreshPending = false;
         notify();
         update();
     }
@@ -1957,8 +2516,7 @@ protected:
             if (event->type() == QEvent::TouchEnd)
                 m_active.clear();
             m_maxContacts = std::max(m_maxContacts, m_active.size());
-            notify();
-            update();
+            scheduleRefresh();
             event->accept();
             return true;
         }
@@ -1970,8 +2528,7 @@ protected:
         m_active[0] = event->localPos();
         appendTrail(0, event->localPos());
         m_maxContacts = std::max(m_maxContacts, 1);
-        notify();
-        update();
+        scheduleRefresh();
     }
 
     void mouseMoveEvent(QMouseEvent *event) override
@@ -1980,16 +2537,14 @@ protected:
             return;
         m_active[0] = event->localPos();
         appendTrail(0, event->localPos());
-        notify();
-        update();
+        scheduleRefresh();
     }
 
     void mouseReleaseEvent(QMouseEvent *event) override
     {
         appendTrail(0, event->localPos());
         m_active.remove(0);
-        notify();
-        update();
+        scheduleRefresh();
     }
 
     void paintEvent(QPaintEvent *) override
@@ -2052,6 +2607,13 @@ private:
             trail.remove(0, trail.size() - 100);
     }
 
+    void scheduleRefresh()
+    {
+        m_refreshPending = true;
+        if (!m_refreshTimer.isActive())
+            m_refreshTimer.start(33);
+    }
+
     void notify()
     {
         if (onPointsChanged)
@@ -2060,7 +2622,9 @@ private:
 
     QMap<int, QPointF> m_active;
     QMap<int, QVector<QPointF>> m_trails;
+    QTimer m_refreshTimer;
     int m_maxContacts = 0;
+    bool m_refreshPending = false;
 };
 
 class TouchPage final : public QWidget
@@ -2585,6 +3149,7 @@ public:
         setWindowFlags(Qt::FramelessWindowHint);
         setupStyle();
         setupUi();
+        qApp->installEventFilter(this);
 
         updateSystem();
         connect(&m_systemTimer, &QTimer::timeout, this, [this]() { updateSystem(); });
@@ -2599,6 +3164,12 @@ public:
     void runAudioTest(int durationMs)
     {
         showPage(4);
+        m_audioPage->onAutomatedTestFinished = [this](bool okay) {
+            const bool finalOkay = okay && m_stack->currentIndex() == 4;
+            qInfo().noquote() << QStringLiteral("AUDIO ok=%1 page=%2")
+                .arg(finalOkay ? 1 : 0).arg(m_stack->currentIndex());
+            QCoreApplication::exit(finalOkay ? 0 : 33);
+        };
         m_audioPage->runAutomatedTest(durationMs);
     }
 
@@ -2608,10 +3179,17 @@ public:
         m_visionPage->runAutomatedProbe();
     }
 
-    void runVisionLaunchTest(const QString &binaryName, int durationMs)
+    void runVisionLaunchTest(const QString &binaryName)
     {
         showPage(5);
-        m_visionPage->runAutomatedLaunch(binaryName, durationMs);
+        m_visionPage->onAutomatedLaunchFinished = [this, binaryName](bool okay) {
+            const bool finalOkay = okay && isVisible() && m_stack->currentIndex() == 5;
+            qInfo().noquote() << QStringLiteral("VISION app=%1 ok=%2 page=%3 visible=%4")
+                .arg(binaryName).arg(finalOkay ? 1 : 0)
+                .arg(m_stack->currentIndex()).arg(isVisible() ? 1 : 0);
+            QCoreApplication::exit(finalOkay ? 0 : 34);
+        };
+        m_visionPage->runAutomatedLaunch(binaryName);
     }
 
     void openHardwareKeyForTest()
@@ -2629,6 +3207,32 @@ public:
     {
         showPage(8);
         m_selfTestPage->saveReport();
+    }
+
+    bool runHomeButtonTest(int expectedPage)
+    {
+        const int fromPage = m_stack->currentIndex();
+        m_bottomHomeButton->click();
+        QApplication::processEvents();
+        const bool okay = expectedPage >= 1 && fromPage == expectedPage
+            && m_stack->currentIndex() == 0;
+        qInfo().noquote() << QStringLiteral("HOME from=%1 ok=%2")
+            .arg(fromPage).arg(okay ? 1 : 0);
+        return okay;
+    }
+
+    bool runBackKeyTest(int expectedPage)
+    {
+        const int fromPage = m_stack->currentIndex();
+        QKeyEvent press(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+        QWidget *target = QApplication::focusWidget();
+        QApplication::sendEvent(target ? target : this, &press);
+        QApplication::processEvents();
+        const bool okay = expectedPage >= 1 && fromPage == expectedPage
+            && m_stack->currentIndex() == 0 && !m_exitRequested;
+        qInfo().noquote() << QStringLiteral("BACK from=%1 ok=%2")
+            .arg(fromPage).arg(okay ? 1 : 0);
+        return okay;
     }
 
     bool runLayoutTest()
@@ -2661,6 +3265,26 @@ public:
     }
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (isVisible() && event->type() == QEvent::KeyPress) {
+            auto *key = static_cast<QKeyEvent *>(event);
+            if (key->key() == Qt::Key_Back || key->key() == Qt::Key_Escape) {
+                if (key->isAutoRepeat()) {
+                    key->accept();
+                    return true;
+                }
+                if (m_stack->currentIndex() == 0)
+                    requestExit();
+                else
+                    showPage(0);
+                key->accept();
+                return true;
+            }
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
     void resizeEvent(QResizeEvent *event) override
     {
         QWidget::resizeEvent(event);
@@ -2670,7 +3294,7 @@ protected:
     void keyPressEvent(QKeyEvent *event) override
     {
         if (event->key() == Qt::Key_Back || event->key() == Qt::Key_Escape) {
-            if (m_stack->currentIndex() == 6) {
+            if (event->isAutoRepeat()) {
                 event->accept();
                 return;
             }
@@ -2695,6 +3319,7 @@ private:
         area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         area->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
         area->setWidget(page);
+        QScroller::grabGesture(area->viewport(), QScroller::TouchGesture);
         return area;
     }
 
@@ -2747,6 +3372,7 @@ private:
 
         m_homePage->onNavigate = [this](int page) { showPage(page); };
         m_ioPage->onAdcChanged = [this](int raw) { m_homePage->updateAdc(raw); };
+        m_homePage->updateAdc(m_ioPage->currentRaw());
         m_visionPage->onExternalAppActive = [this](bool active) {
             if (active) {
                 hide();
@@ -2796,8 +3422,8 @@ private:
     {
         if (index < 0 || index >= m_stack->count())
             return;
-        if (m_stack->currentIndex() == 1 && index != 1)
-            m_ioPage->leavePage();
+        if (m_stack->currentIndex() == 4 && index != 4)
+            m_audioPage->leavePage();
         static const QStringList titles = {
             QString::fromUtf8("RV1126B 实验台"),
             QString::fromUtf8("IO / ADC 实验"),
@@ -2810,6 +3436,8 @@ private:
             QString::fromUtf8("一键自检")
         };
         m_stack->setCurrentIndex(index);
+        m_ioPage->setActive(index == 1);
+        m_hardwarePage->setActive(index == 6);
         if (index == 8)
             m_selfTestPage->runChecks();
         m_titleLabel->setText(titles.value(index));
@@ -2834,7 +3462,7 @@ private:
         m_exitButton->setText(QString::fromUtf8("正在返回…"));
         m_bottomExitButton->setText(QString::fromUtf8("正在返回系统桌面…"));
         QTimer::singleShot(80, this, [this]() { hide(); });
-        QTimer::singleShot(120, qApp, []() { QCoreApplication::exit(0); });
+        m_audioPage->shutdown([]() { QCoreApplication::exit(0); });
     }
 
     void updateSystem()
@@ -2845,6 +3473,11 @@ private:
             m_previousCpu = current;
         m_homePage->updateSystem(snapshot);
         m_systemPage->updateSnapshot(snapshot);
+        bool adcOk = false;
+        const int adcRaw = readText(QStringLiteral(
+            "/sys/bus/iio/devices/iio:device0/in_voltage4_raw")).trimmed().toInt(&adcOk);
+        if (adcOk)
+            m_homePage->updateAdc(qBound(0, adcRaw, 8191));
     }
 
     void setupStyle()
@@ -2884,6 +3517,24 @@ private:
             QScrollArea#pageScrollArea {
                 border: none;
                 background-color: #0f172a;
+            }
+            QScrollBar:vertical {
+                width: 22px;
+                margin: 4px 2px;
+                border: none;
+                border-radius: 9px;
+                background-color: #111c30;
+            }
+            QScrollBar::handle:vertical {
+                min-height: 64px;
+                border-radius: 9px;
+                background-color: #3b82a0;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
             }
             QPushButton#bottomHomeButton, QPushButton#bottomExitButton {
                 min-height: 58px;
@@ -3096,8 +3747,26 @@ int main(int argc, char *argv[])
     app.setFont(font);
 
     MainWindow window;
+    const auto envFlag = [](const char *name) {
+        const QString value = qEnvironmentVariable(name).trimmed().toLower();
+        return value == QStringLiteral("1") || value == QStringLiteral("true")
+            || value == QStringLiteral("yes");
+    };
     bool startPageOk = false;
     const int startPage = qEnvironmentVariableIntValue("RV1126BLAB_START_PAGE", &startPageOk);
+    const bool layoutTest = envFlag("RV1126BLAB_LAYOUT_TEST");
+    const bool homeTest = envFlag("RV1126BLAB_HOME_TEST");
+    const bool backTest = envFlag("RV1126BLAB_BACK_TEST");
+    if ((homeTest || backTest)
+        && (!startPageOk || startPage < 1 || startPage > 8)) {
+        qCritical() << "HOME/BACK test requires RV1126BLAB_START_PAGE=1..8";
+        return 91;
+    }
+    if (static_cast<int>(layoutTest) + static_cast<int>(homeTest)
+        + static_cast<int>(backTest) > 1) {
+        qCritical() << "Only one of LAYOUT_TEST, HOME_TEST and BACK_TEST may be enabled";
+        return 90;
+    }
     const QString screenshotPath = qEnvironmentVariable("RV1126BLAB_SCREENSHOT");
     if (screenshotPath.isEmpty()) {
         if (app.primaryScreen())
@@ -3114,28 +3783,42 @@ int main(int argc, char *argv[])
         window.openPageForTest(startPageOk ? startPage : 0);
     });
     bool audioTestOk = false;
+    const QString audioTestValue = qEnvironmentVariable("RV1126BLAB_AUDIO_TEST_MS");
     const int audioTestMs = qEnvironmentVariableIntValue(
         "RV1126BLAB_AUDIO_TEST_MS", &audioTestOk);
+    if (!audioTestValue.isEmpty() && (!audioTestOk || audioTestMs <= 0)) {
+        qCritical() << "RV1126BLAB_AUDIO_TEST_MS must be a positive integer";
+        return 93;
+    }
     if (audioTestOk && audioTestMs > 0) {
         QTimer::singleShot(100, &window, [&window, audioTestMs]() {
             window.runAudioTest(audioTestMs);
         });
     }
-    if (qEnvironmentVariableIsSet("RV1126BLAB_VISION_PROBE")) {
+    if (envFlag("RV1126BLAB_VISION_PROBE")) {
         QTimer::singleShot(100, &window, [&window]() {
             window.runVisionProbeTest();
         });
     }
     const QString visionLaunchTest = qEnvironmentVariable("RV1126BLAB_VISION_LAUNCH_TEST");
-    if (visionLaunchTest == QStringLiteral("camera")
-        || visionLaunchTest == QStringLiteral("aispark")) {
-        bool launchDurationOk = false;
-        const int launchDuration = qEnvironmentVariableIntValue(
-            "RV1126BLAB_VISION_LAUNCH_MS", &launchDurationOk);
-        QTimer::singleShot(200, &window, [&window, visionLaunchTest,
-            launchDurationOk, launchDuration]() {
-            window.runVisionLaunchTest(visionLaunchTest,
-                launchDurationOk ? launchDuration : 2500);
+    if (!visionLaunchTest.isEmpty()
+        && visionLaunchTest != QStringLiteral("camera")
+        && visionLaunchTest != QStringLiteral("aispark")) {
+        qCritical() << "RV1126BLAB_VISION_LAUNCH_TEST must be camera or aispark";
+        return 94;
+    }
+    const bool visionLaunchEnabled = visionLaunchTest == QStringLiteral("camera")
+        || visionLaunchTest == QStringLiteral("aispark");
+    const int resultTestCount = static_cast<int>(audioTestOk && audioTestMs > 0)
+        + static_cast<int>(visionLaunchEnabled) + static_cast<int>(layoutTest)
+        + static_cast<int>(homeTest) + static_cast<int>(backTest);
+    if (resultTestCount > 1) {
+        qCritical() << "Only one result-producing automated test may be enabled";
+        return 92;
+    }
+    if (visionLaunchEnabled) {
+        QTimer::singleShot(200, &window, [&window, visionLaunchTest]() {
+            window.runVisionLaunchTest(visionLaunchTest);
         });
     }
     if (qEnvironmentVariable("RV1126BLAB_HARDWARE_TAB") == QStringLiteral("key")) {
@@ -3143,26 +3826,43 @@ int main(int argc, char *argv[])
             window.openHardwareKeyForTest();
         });
     }
-    if (qEnvironmentVariableIsSet("RV1126BLAB_EXIT_TEST")) {
+    const bool exitTest = envFlag("RV1126BLAB_EXIT_TEST");
+    if (exitTest) {
         QTimer::singleShot(500, &window, [&window]() {
             window.runExitButtonTest();
         });
     }
-    if (qEnvironmentVariableIsSet("RV1126BLAB_SELF_TEST_SAVE")) {
+    if (envFlag("RV1126BLAB_SELF_TEST_SAVE")) {
         QTimer::singleShot(300, &window, [&window]() {
             window.runSelfTestSave();
         });
     }
-    if (qEnvironmentVariableIsSet("RV1126BLAB_LAYOUT_TEST")) {
+    if (layoutTest) {
         QTimer::singleShot(300, &window, [&window]() {
             QCoreApplication::exit(window.runLayoutTest() ? 0 : 30);
+        });
+    }
+    if (homeTest) {
+        QTimer::singleShot(350, &window, [&window, startPage]() {
+            QCoreApplication::exit(window.runHomeButtonTest(startPage) ? 0 : 31);
+        });
+    }
+    if (backTest) {
+        QTimer::singleShot(350, &window, [&window, startPage]() {
+            QCoreApplication::exit(window.runBackKeyTest(startPage) ? 0 : 32);
         });
     }
 
     bool autoExitOk = false;
     const int autoExitMs = qEnvironmentVariableIntValue("RV1126BLAB_AUTO_EXIT_MS", &autoExitOk);
-    if (autoExitOk && autoExitMs > 0)
-        QTimer::singleShot(autoExitMs, &app, &QApplication::quit);
+    if (autoExitOk && autoExitMs > 0) {
+        const bool testWatchdog = (audioTestOk && audioTestMs > 0)
+            || visionLaunchEnabled
+            || layoutTest || homeTest || backTest || exitTest;
+        QTimer::singleShot(autoExitMs, &app, [testWatchdog]() {
+            QCoreApplication::exit(testWatchdog ? 39 : 0);
+        });
+    }
 
     return app.exec();
 }
