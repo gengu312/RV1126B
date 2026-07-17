@@ -8,7 +8,11 @@ lib_dir="$repo_root/build/board-sysroot/usr/lib"
 output="$build_dir/rv1126blab"
 qt_include="/usr/include/x86_64-linux-gnu/qt5"
 
-for command_name in aarch64-linux-gnu-g++ aarch64-linux-gnu-strip; do
+for command_name in \
+    aarch64-linux-gnu-g++ \
+    aarch64-linux-gnu-objdump \
+    aarch64-linux-gnu-strip
+do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         printf 'Missing command: %s\n' "$command_name" >&2
         exit 1
@@ -34,6 +38,7 @@ aarch64-linux-gnu-g++ \
     -O2 \
     -pipe \
     -fPIC \
+    -fno-exceptions \
     -Wall \
     -Wextra \
     -I"$qt_include" \
@@ -50,4 +55,10 @@ aarch64-linux-gnu-g++ \
     -o "$output"
 
 aarch64-linux-gnu-strip --strip-unneeded "$output"
+if aarch64-linux-gnu-objdump -T "$output" \
+    | grep -Eq '\(CXXABI_1\.3\.(1[5-9]|[2-9][0-9]+)\)'
+then
+    printf 'Binary requires a CXXABI newer than the board maximum 1.3.14.\n' >&2
+    exit 1
+fi
 printf 'Built %s\n' "$output"

@@ -38,6 +38,8 @@ powershell -ExecutionPolicy Bypass -File .\apps\rv1126b_lab\prepare_sysroot.ps1
 wsl -e sh -lc "cd /mnt/d/WorkSpace/RV1126B && ./apps/rv1126b_lab/build_wsl.sh"
 ```
 
+构建脚本关闭本程序未使用的 C++ 异常展开，避免较新的 WSL GCC 引入板端 `libstdc++` 不支持的 `CXXABI_1.3.15`。
+
 输出文件位于被 Git 忽略的 `build/rv1126b-lab/rv1126blab`。
 
 ## 安装
@@ -47,6 +49,8 @@ powershell -ExecutionPolicy Bypass -File .\apps\rv1126b_lab\install.ps1
 ```
 
 安装位置为 `/opt/ui/src/apps/rv1126blab`。当前桌面中“ADC 调速灯”位于 `apk1.cfg` 第 13 项，安装器会把“RV1126B实验台”放在紧邻的第 14 项；屏幕上两者位于同一页相邻空位。安装器会从 `apk2.cfg` 和底部 Dock 的 `apk3.cfg` 中移除旧的实验台入口，不改变这些页面其余图标的顺序。安装脚本不会自动重启开发板，重启后桌面会刷新入口位置。
+
+安装器会先把新文件放在 `/tmp` 并检查板端动态库兼容性；依赖缺失时会停止安装，不覆盖当前可运行版本。
 
 程序顶部和底部都提供返回入口。由于厂商的控制中心/动态岛可能覆盖屏幕顶部触摸区，底部红色“返回系统桌面”是主要退出入口；点击后界面会立即隐藏并显示 SystemUI 桌面，程序在后台停止录音、恢复混音状态后退出，异常时由总超时保护结束清理。底部蓝色“实验台主页”只返回本程序主页，不会退出。
 
