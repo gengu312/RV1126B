@@ -1,6 +1,7 @@
 # 本机采集结果和构建产物
 output/
 build/
+tmp/
 
 # 本机连接配置
 device.env

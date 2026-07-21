@@ -7,6 +7,9 @@
 | 第一个 GPIO 输出 | 板载工作/用户指示灯 | WORK_PWM_LED | GPIO0_C5；LED class `work` | 3.3 V 域 | 内核 LED 驱动，默认 heartbeat | 核心板引脚定义表 B 座 53；实机 debugfs | 是 |
 | 第一个 GPIO 输入 | TODO | TODO | TODO | TODO | TODO | TODO | 否 |
 | ADC 输入 | 板子右下角可调电位器 | SARADC0_IN4 | `iio:device0/in_voltage4_raw` | 正常输入 0～1.8 V | 专用 ADC，板载电位器 | 核心板引脚定义表 A 座 70；规格书第 14 页；实机 IIO | 是 |
+| 外部 ADC 1 | 40P 物理第 7 脚 | SARADC0_IN6 | `iio:device0/in_voltage6_raw` | 正常输入 0～1.8 V | 无板载分压，外部信号不得超过 1.8 V | 底板原理图第 13 页；实机 IIO | 是 |
+| 外部 ADC 2 | 40P 物理第 8 脚 | SARADC0_IN1_CDS | `iio:device0/in_voltage1_raw` | 正常输入 0～1.8 V | 无板载分压，外部信号不得超过 1.8 V | 底板原理图第 13 页；实机 IIO | 是 |
+| 临时压力开关输入 | 40P 第 29 脚读取、第 31 脚激励 | GPIO3_B1 / GPIO3_B0 | `/dev/gpiochip3` offset 9 / 8 | 3.3 V GPIO | 仅适合无源两脚压阻传感器的按下/松开演示，不代表连续力度 | 底板原理图第 13 页；实机 GPIO cdev | 是 |
 | GND | TODO | GND | 不适用 | 0 V | 不适用 | TODO | 否 |
 
 ## 操作前检查
