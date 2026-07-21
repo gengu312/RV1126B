@@ -10,13 +10,15 @@
 - 系统监控：CPU、内存、根分区、温度、运行时间与设备状态；
 - 音频实验：触摸录音、实时音量与波形、WAV 保存和触摸回放；
 - 摄像头 / AI：检测 IMX415 的 V4L2 格式，并受控启动官方相机或 AiSpark YOLO；
-- 总线 / 按键：只读列出 I2C、UART、CAN、PWM、SPI 状态，并实时显示板载实体按键事件；
+- 总线 / 传感器：只读列出 I2C、UART、CAN、PWM、SPI 状态，显示板载按键事件，并读取 N1 ADC 的压力原始值、相对力度和近 30 秒曲线；
 - 一键自检：汇总 IO/ADC、触摸、音频、摄像头/NPU、网络无线、扩展总线和系统健康状态，并保存纯文本报告；
 - 使用说明：直接在板上查看各功能的操作步骤。
 
 主页集中显示状态摘要和功能入口。各功能页底部固定提供“实验台主页”和“返回系统桌面”两个按钮，实体返回键也会统一返回主页；较长页面支持手指拖动滚动，不会再把返回入口挤出屏幕。
 
 程序只在用户选择 LED 控制模式时接管板载工作灯；切回“只看数据”或退出程序时，会恢复进入前的触发器和亮度。
+
+压力输入接法为 `1.8 V → FSR → N1（40P 物理 8 脚）→ 10 kΩ → GND`。程序只读 `in_voltage1_raw` 和 `in_voltage_scale`，进入页面后用约 2 秒松开状态建立零点，再用五点中位数和指数平滑显示相对力度；离开页面即停止采样。百分比是相对于零点和 ADC 满量程的比较值，不是牛顿值，也不能替代标定过的测力设备。
 
 音频录制使用板载 ES8390。开始录音前程序异步保存完整混音状态，只临时调整采集音量和 PGA，不启用 ADC 到扬声器直通；每条混音命令都有超时保护，停止录音或离开页面后异步恢复原状态，不会再堵塞主页与退出按钮。录音保存在 `/userdata/rv1126b_lab/audio/`。
 
@@ -87,7 +89,9 @@ powershell -ExecutionPolicy Bypass -File .\apps\rv1126b_lab\install.ps1
 - `RV1126BLAB_VISION_PROBE=1`：自动运行一次只读的 V4L2 格式检测；
 - `RV1126BLAB_VISION_LAUNCH_TEST=camera`：自动启动并关闭一次 `camera` 或 `aispark` 子程序；
 - `RV1126BLAB_EXTERNAL_TIMEOUT_MS=1500`：测试时改写相机/AI 自动返回时限；
-- `RV1126BLAB_HARDWARE_TAB=key`：测试时直接打开板载物理按键子页；
+- `RV1126BLAB_HARDWARE_TAB=key`：测试时直接打开板载物理按键子页；设为 `pressure` 时打开压力输入子页；
+- `RV1126BLAB_PRESSURE_ADC_PATH=/tmp/in_voltage1_raw`：测试时替换压力页的 N1 原始值文件；
+- `RV1126BLAB_PRESSURE_SCALE_PATH=/tmp/in_voltage_scale`：测试时替换压力页的 ADC scale 文件；
 - `RV1126BLAB_EXIT_TEST=1`：模拟点击“返回桌面”按钮并验证进程退出；
 - `RV1126BLAB_SELF_TEST_SAVE=1`：自动执行一键自检并保存报告；
 - `RV1126BLAB_REPORT_DIR=/tmp/selftest`：测试时改写自检报告目录；

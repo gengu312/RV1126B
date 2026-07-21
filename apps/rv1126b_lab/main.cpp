@@ -355,8 +355,8 @@ public:
             QString::fromUtf8("录音、波形、音量、回放"), 1, 1, 4);
         addModuleButton(grid, QString::fromUtf8("摄像头 / AI"),
             QString::fromUtf8("IMX415、NPU、YOLO"), 2, 0, 5);
-        addModuleButton(grid, QString::fromUtf8("总线 / 按键"),
-            QString::fromUtf8("I2C、串口、CAN、PWM"), 2, 1, 6);
+        addModuleButton(grid, QString::fromUtf8("总线 / 传感器"),
+            QString::fromUtf8("接口、按键、N1 压力"), 2, 1, 6);
         addModuleButton(grid, QString::fromUtf8("一键自检"),
             QString::fromUtf8("自动检查硬件与系统"), 3, 0, 8);
         addModuleButton(grid, QString::fromUtf8("使用说明"),
@@ -2396,6 +2396,285 @@ private:
     int m_pressCount = 0;
 };
 
+class PressurePanel final : public QWidget
+{
+public:
+    explicit PressurePanel(QWidget *parent = nullptr)
+        : QWidget(parent)
+        , m_iioRoot(qEnvironmentVariable("RV1126BLAB_IIO_DEVICE",
+              "/sys/bus/iio/devices/iio:device0"))
+    {
+        setupUi();
+        inspectHardware();
+        resetCalibration();
+        connect(&m_sampleTimer, &QTimer::timeout, this, [this]() { sample(); });
+    }
+
+    void setActive(bool active)
+    {
+        if (!active) {
+            m_sampleTimer.stop();
+            return;
+        }
+        inspectHardware();
+        sample();
+        if (m_hardwareReady)
+            m_sampleTimer.start(kSampleIntervalMs);
+    }
+
+private:
+    static constexpr int kSampleIntervalMs = 100;
+    static constexpr int kCalibrationSamples = 20;
+    static constexpr int kHistorySamples = 300;
+
+    void setupUi()
+    {
+        auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 12, 0, 0);
+        root->setSpacing(14);
+
+        auto *wiringPanel = makePanel(this);
+        auto *wiringLayout = new QVBoxLayout(wiringPanel);
+        wiringLayout->setContentsMargins(20, 14, 20, 14);
+        wiringLayout->addWidget(makeSectionTitle(
+            QString::fromUtf8("N1 模拟压力（ADC）"), wiringPanel));
+        auto *wiring = new QLabel(QString::fromUtf8(
+            "接线：1.8 V → FSR → N1（40P 物理 8 脚）→ 10 kΩ → GND。\n"
+            "本页只读 in_voltage1_raw，不会驱动任何 GPIO。"), wiringPanel);
+        wiring->setObjectName(QStringLiteral("statusText"));
+        wiring->setWordWrap(true);
+        wiringLayout->addWidget(wiring);
+        root->addWidget(wiringPanel);
+
+        auto *valuePanel = makePanel(this);
+        auto *valueLayout = new QVBoxLayout(valuePanel);
+        valueLayout->setContentsMargins(20, 18, 20, 18);
+        valueLayout->setSpacing(10);
+        m_stateLabel = new QLabel(QString::fromUtf8("正在校准"), valuePanel);
+        m_stateLabel->setObjectName(QStringLiteral("pressureState"));
+        m_stateLabel->setProperty("level", QStringLiteral("calibrating"));
+        m_stateLabel->setAlignment(Qt::AlignCenter);
+        m_percentLabel = new QLabel(QString::fromUtf8("相对力度 --"), valuePanel);
+        m_percentLabel->setObjectName(QStringLiteral("adcValue"));
+        m_percentLabel->setAlignment(Qt::AlignCenter);
+        m_valueLabel = new QLabel(QString::fromUtf8(
+            "原始值 -- / 8191    平滑值 --\n电压 -- V"), valuePanel);
+        m_valueLabel->setObjectName(QStringLiteral("statusText"));
+        m_valueLabel->setAlignment(Qt::AlignCenter);
+        valueLayout->addWidget(m_stateLabel);
+        valueLayout->addWidget(m_percentLabel);
+        valueLayout->addWidget(m_valueLabel);
+        root->addWidget(valuePanel);
+
+        auto *chartHeader = new QHBoxLayout;
+        chartHeader->addWidget(makeSectionTitle(
+            QString::fromUtf8("近 30 秒相对力度曲线"), this));
+        auto *resetButton = new QPushButton(QString::fromUtf8("清零并重新校准"), this);
+        resetButton->setObjectName(QStringLiteral("smallButton"));
+        connect(resetButton, &QPushButton::clicked,
+            this, [this]() { resetCalibration(); });
+        chartHeader->addStretch();
+        chartHeader->addWidget(resetButton);
+        root->addLayout(chartHeader);
+
+        m_chart = new LineChart(this);
+        root->addWidget(m_chart, 1);
+
+        m_baselineLabel = new QLabel(this);
+        m_baselineLabel->setObjectName(QStringLiteral("notice"));
+        m_baselineLabel->setAlignment(Qt::AlignCenter);
+        m_baselineLabel->setWordWrap(true);
+        root->addWidget(m_baselineLabel);
+
+        m_errorLabel = new QLabel(this);
+        m_errorLabel->setObjectName(QStringLiteral("error"));
+        m_errorLabel->setAlignment(Qt::AlignCenter);
+        m_errorLabel->setWordWrap(true);
+        root->addWidget(m_errorLabel);
+
+        auto *note = new QLabel(QString::fromUtf8(
+            "“相对力度”按零点到 ADC 满量程归一，只适合比较轻重，不是牛顿值。"
+            "重新校准的约 2 秒内请完全松开传感器。"), this);
+        note->setObjectName(QStringLiteral("notice"));
+        note->setAlignment(Qt::AlignCenter);
+        note->setWordWrap(true);
+        root->addWidget(note);
+    }
+
+    void inspectHardware()
+    {
+        m_hardwareReady = QFile::exists(rawPath());
+        bool scaleOk = false;
+        const double scale = readText(scalePath())
+            .trimmed().toDouble(&scaleOk);
+        m_scaleReady = scaleOk && scale > 0.0;
+        if (m_scaleReady)
+            m_scaleMillivolts = scale;
+
+        if (!m_hardwareReady)
+            m_errorLabel->setText(QString::fromUtf8("未找到 N1：%1").arg(rawPath()));
+        else if (!m_scaleReady)
+            m_errorLabel->setText(QString::fromUtf8(
+                "N1 原始值可读，但 in_voltage_scale 不可用，暂不显示电压。"));
+        else
+            m_errorLabel->clear();
+    }
+
+    QString rawPath() const
+    {
+        const QString override = qEnvironmentVariable("RV1126BLAB_PRESSURE_ADC_PATH");
+        return override.isEmpty()
+            ? m_iioRoot + QStringLiteral("/in_voltage1_raw") : override;
+    }
+
+    QString scalePath() const
+    {
+        const QString override = qEnvironmentVariable("RV1126BLAB_PRESSURE_SCALE_PATH");
+        return override.isEmpty()
+            ? m_iioRoot + QStringLiteral("/in_voltage_scale") : override;
+    }
+
+    void sample()
+    {
+        if (!m_hardwareReady)
+            return;
+
+        bool ok = false;
+        const int raw = readText(rawPath()).trimmed().toInt(&ok);
+        if (!ok) {
+            m_errorLabel->setText(QString::fromUtf8("N1 ADC 读取失败。"));
+            setState(QString::fromUtf8("压力输入不可用"), QStringLiteral("error"));
+            return;
+        }
+        if (m_scaleReady)
+            m_errorLabel->clear();
+
+        m_currentRaw = qBound(0, raw, 8191);
+        m_filterWindow.append(m_currentRaw);
+        if (m_filterWindow.size() > 5)
+            m_filterWindow.removeFirst();
+        QVector<int> sorted = m_filterWindow;
+        std::sort(sorted.begin(), sorted.end());
+        const int median = sorted.at(sorted.size() / 2);
+        if (!m_filterReady) {
+            m_filtered = median;
+            m_filterReady = true;
+        } else {
+            m_filtered = 0.65 * m_filtered + 0.35 * median;
+        }
+        updateValues();
+
+        if (!m_calibrated) {
+            m_calibrationSum += median;
+            ++m_calibrationCount;
+            m_baselineLabel->setText(QString::fromUtf8(
+                "零点校准 %1 / %2：请保持完全松开")
+                .arg(m_calibrationCount).arg(kCalibrationSamples));
+            setState(QString::fromUtf8("正在校准"), QStringLiteral("calibrating"));
+            m_percentLabel->setText(QString::fromUtf8("相对力度 --"));
+            if (m_calibrationCount >= kCalibrationSamples) {
+                m_baseline = qBound(0, static_cast<int>(std::lround(
+                    static_cast<double>(m_calibrationSum) / m_calibrationCount)), 8190);
+                m_calibrated = true;
+                m_baselineLabel->setText(QString::fromUtf8(
+                    "零点基线 %1 · 100 ms/点 · 曲线窗口约 30 秒")
+                    .arg(m_baseline));
+            } else {
+                return;
+            }
+        }
+
+        const double span = std::max(1, 8191 - m_baseline);
+        const double relative = qBound(0.0,
+            100.0 * (m_filtered - m_baseline) / span, 100.0);
+        m_percentLabel->setText(QString::fromUtf8("相对力度 %1%")
+            .arg(relative, 0, 'f', 1));
+        updatePressureState(relative);
+
+        m_history.append(qBound(0,
+            static_cast<int>(std::lround(relative * 8191.0 / 100.0)), 8191));
+        if (m_history.size() > kHistorySamples)
+            m_history.remove(0, m_history.size() - kHistorySamples);
+        m_chart->setValues(m_history);
+    }
+
+    void updateValues()
+    {
+        const QString voltage = m_scaleReady
+            ? QString::number(m_currentRaw * m_scaleMillivolts / 1000.0, 'f', 3)
+            : QStringLiteral("--");
+        m_valueLabel->setText(QString::fromUtf8(
+            "原始值 %1 / 8191    平滑值 %2\n电压 %3 V")
+            .arg(m_currentRaw)
+            .arg(static_cast<int>(std::lround(m_filtered)))
+            .arg(voltage));
+    }
+
+    void updatePressureState(double relative)
+    {
+        if (relative < 3.0)
+            setState(QString::fromUtf8("○ 松开"), QStringLiteral("released"));
+        else if (relative < 25.0)
+            setState(QString::fromUtf8("● 轻按"), QStringLiteral("light"));
+        else if (relative < 60.0)
+            setState(QString::fromUtf8("● 中等"), QStringLiteral("medium"));
+        else
+            setState(QString::fromUtf8("● 重按"), QStringLiteral("heavy"));
+    }
+
+    void setState(const QString &text, const QString &level)
+    {
+        m_stateLabel->setText(text);
+        if (m_stateLabel->property("level").toString() == level)
+            return;
+        m_stateLabel->setProperty("level", level);
+        m_stateLabel->style()->unpolish(m_stateLabel);
+        m_stateLabel->style()->polish(m_stateLabel);
+        m_stateLabel->update();
+    }
+
+    void resetCalibration()
+    {
+        m_calibrated = false;
+        m_filterReady = false;
+        m_filterWindow.clear();
+        m_calibrationSum = 0;
+        m_calibrationCount = 0;
+        m_baseline = 0;
+        m_history.clear();
+        if (m_chart)
+            m_chart->setValues(m_history);
+        if (m_baselineLabel)
+            m_baselineLabel->setText(QString::fromUtf8(
+                "零点校准 0 / %1：请保持完全松开").arg(kCalibrationSamples));
+        if (m_percentLabel)
+            m_percentLabel->setText(QString::fromUtf8("相对力度 --"));
+        if (m_stateLabel)
+            setState(QString::fromUtf8("正在校准"), QStringLiteral("calibrating"));
+    }
+
+    QString m_iioRoot;
+    QLabel *m_stateLabel = nullptr;
+    QLabel *m_percentLabel = nullptr;
+    QLabel *m_valueLabel = nullptr;
+    QLabel *m_baselineLabel = nullptr;
+    QLabel *m_errorLabel = nullptr;
+    LineChart *m_chart = nullptr;
+    QTimer m_sampleTimer;
+    QVector<int> m_history;
+    QVector<int> m_filterWindow;
+    qint64 m_calibrationSum = 0;
+    int m_calibrationCount = 0;
+    int m_baseline = 0;
+    int m_currentRaw = 0;
+    double m_filtered = 0.0;
+    double m_scaleMillivolts = 0.0;
+    bool m_hardwareReady = false;
+    bool m_scaleReady = false;
+    bool m_calibrated = false;
+    bool m_filterReady = false;
+};
+
 class HardwarePage final : public QWidget
 {
 public:
@@ -2409,22 +2688,27 @@ public:
         auto *switches = new QHBoxLayout;
         m_busButton = new QPushButton(QString::fromUtf8("总线与扩展接口"), this);
         m_keyButton = new QPushButton(QString::fromUtf8("板载物理按键"), this);
-        for (QPushButton *button : { m_busButton, m_keyButton })
+        m_pressureButton = new QPushButton(QString::fromUtf8("压力输入"), this);
+        for (QPushButton *button : { m_busButton, m_keyButton, m_pressureButton })
             button->setObjectName(QStringLiteral("actionButton"));
         switches->addWidget(m_busButton);
         switches->addWidget(m_keyButton);
+        switches->addWidget(m_pressureButton);
         root->addLayout(switches);
 
         m_stack = new QStackedWidget(this);
         m_stack->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
         m_busPanel = new BusPanel(m_stack);
         m_keyPanel = new KeyPanel(m_stack);
+        m_pressurePanel = new PressurePanel(m_stack);
         m_stack->addWidget(m_busPanel);
         m_stack->addWidget(m_keyPanel);
+        m_stack->addWidget(m_pressurePanel);
         root->addWidget(m_stack, 1);
 
         connect(m_busButton, &QPushButton::clicked, this, [this]() { showTab(0); });
         connect(m_keyButton, &QPushButton::clicked, this, [this]() { showTab(1); });
+        connect(m_pressureButton, &QPushButton::clicked, this, [this]() { showTab(2); });
         showTab(0);
     }
 
@@ -2433,10 +2717,16 @@ public:
         showTab(1);
     }
 
+    void openPressureForTest()
+    {
+        showTab(2);
+    }
+
     void setActive(bool active)
     {
         m_active = active;
         m_keyPanel->setActive(active && m_stack->currentIndex() == 1);
+        m_pressurePanel->setActive(active && m_stack->currentIndex() == 2);
     }
 
 private:
@@ -2445,7 +2735,8 @@ private:
         m_stack->setCurrentIndex(index);
         m_busButton->setProperty("active", index == 0);
         m_keyButton->setProperty("active", index == 1);
-        for (QPushButton *button : { m_busButton, m_keyButton }) {
+        m_pressureButton->setProperty("active", index == 2);
+        for (QPushButton *button : { m_busButton, m_keyButton, m_pressureButton }) {
             button->style()->unpolish(button);
             button->style()->polish(button);
             button->update();
@@ -2453,13 +2744,16 @@ private:
         if (index == 0)
             m_busPanel->refreshSummary();
         m_keyPanel->setActive(m_active && index == 1);
+        m_pressurePanel->setActive(m_active && index == 2);
     }
 
     QStackedWidget *m_stack = nullptr;
     BusPanel *m_busPanel = nullptr;
     KeyPanel *m_keyPanel = nullptr;
+    PressurePanel *m_pressurePanel = nullptr;
     QPushButton *m_busButton = nullptr;
     QPushButton *m_keyButton = nullptr;
+    QPushButton *m_pressureButton = nullptr;
     bool m_active = false;
 };
 
@@ -3123,7 +3417,7 @@ public:
             "4. 五点触摸页：先单指画轨迹，再逐步增加到五指，查看独立编号、坐标和距离。\n\n"
             "5. 音频页：录制一段语音，观察音量和波形，停止后触摸回放。\n\n"
             "6. 摄像头 / AI 页：读取 IMX415 格式，需要时分别打开官方相机和 AiSpark。\n\n"
-            "7. 总线 / 按键页：查看 I2C、UART、CAN、PWM、SPI 状态，再按实体按键观察事件。\n\n"
+            "7. 总线 / 传感器页：查看接口和实体按键；压力输入页读取 N1 模拟值、相对力度和曲线。\n\n"
             "8. 使用底部蓝色按钮返回实验台主页，使用红色按钮退出到系统桌面。"
             "程序退出时会恢复进入前的 LED 与音频混音状态。"), content);
         steps->setObjectName(QStringLiteral("helpText"));
@@ -3196,6 +3490,12 @@ public:
     {
         showPage(6);
         m_hardwarePage->openKeyForTest();
+    }
+
+    void openHardwarePressureForTest()
+    {
+        showPage(6);
+        m_hardwarePage->openPressureForTest();
     }
 
     void runExitButtonTest()
@@ -3431,7 +3731,7 @@ private:
             QString::fromUtf8("系统监控"),
             QString::fromUtf8("音频采集与波形"),
             QString::fromUtf8("摄像头与 AI"),
-            QString::fromUtf8("总线与板载按键"),
+            QString::fromUtf8("总线、按键与 N1 压力"),
             QString::fromUtf8("使用说明"),
             QString::fromUtf8("一键自检")
         };
@@ -3590,6 +3890,40 @@ private:
                 font-size: 27px;
                 font-weight: 650;
                 color: #f8fafc;
+            }
+            QLabel#pressureState {
+                min-height: 92px;
+                border: 2px solid #3b4d66;
+                border-radius: 18px;
+                background-color: #1d293c;
+                color: #cbd5e1;
+                font-size: 38px;
+                font-weight: 750;
+            }
+            QLabel#pressureState[level="calibrating"] {
+                border-color: #38bdf8;
+                background-color: #123249;
+                color: #bae6fd;
+            }
+            QLabel#pressureState[level="released"] {
+                border-color: #64748b;
+                background-color: #1e293b;
+                color: #e2e8f0;
+            }
+            QLabel#pressureState[level="light"] {
+                border-color: #22c55e;
+                background-color: #14532d;
+                color: #dcfce7;
+            }
+            QLabel#pressureState[level="medium"] {
+                border-color: #f59e0b;
+                background-color: #78350f;
+                color: #fef3c7;
+            }
+            QLabel#pressureState[level="heavy"], QLabel#pressureState[level="error"] {
+                border-color: #fb7185;
+                background-color: #7f1d1d;
+                color: #ffe4e6;
             }
             QLabel#checkTitle {
                 font-size: 21px;
@@ -3821,9 +4155,14 @@ int main(int argc, char *argv[])
             window.runVisionLaunchTest(visionLaunchTest);
         });
     }
-    if (qEnvironmentVariable("RV1126BLAB_HARDWARE_TAB") == QStringLiteral("key")) {
+    const QString hardwareTab = qEnvironmentVariable("RV1126BLAB_HARDWARE_TAB");
+    if (hardwareTab == QStringLiteral("key")) {
         QTimer::singleShot(100, &window, [&window]() {
             window.openHardwareKeyForTest();
+        });
+    } else if (hardwareTab == QStringLiteral("pressure")) {
+        QTimer::singleShot(100, &window, [&window]() {
+            window.openHardwarePressureForTest();
         });
     }
     const bool exitTest = envFlag("RV1126BLAB_EXIT_TEST");
