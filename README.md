@@ -39,6 +39,8 @@
 
 源代码、构建、安装和安全测试方法见 [apps/rv1126b_lab/README.md](apps/rv1126b_lab/README.md)。原来的 [ADC 调速灯](apps/adc_led_touch/README.md) 仍保留为单功能入门原型；外接 FSR 后可使用独立的 [N1 压力监测与声音反馈应用](apps/pressure_monitor/README.md)，音频素材上传、板端试听和触发参数可用 [Windows 压力声音管理器](apps/pressure_audio_manager/README.md) 完成。
 
+在可信局域网中需要摆脱 USB 数据线时，可使用 [Wi-Fi ADB 连接与联网验收工具](scripts/wireless/README.md)；使用后应恢复 USB 模式。
+
 ## 现在先做什么
 
 ### 1. 确认电脑还能看到开发板
