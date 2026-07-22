@@ -1,4 +1,6 @@
 #include <QApplication>
+#include <QCloseEvent>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
@@ -11,7 +13,10 @@
 #include <QPainterPath>
 #include <QProcess>
 #include <QPushButton>
+#include <QSettings>
+#include <QStandardPaths>
 #include <QStyle>
+#include <QStringList>
 #include <QTimer>
 #include <QVector>
 #include <QVBoxLayout>
@@ -27,7 +32,10 @@ constexpr int kSampleIntervalMs = 100;
 constexpr int kCalibrationSamples = 20;
 constexpr int kHistorySamples = 300;
 constexpr int kVoiceStableSamples = 5;
-constexpr int kVoiceCooldownMs = 2000;
+constexpr int kDefaultVoiceCooldownMs = 2000;
+constexpr int kDefaultLightThreshold = 3;
+constexpr int kDefaultMediumThreshold = 25;
+constexpr int kDefaultHeavyThreshold = 60;
 
 enum class PressureState {
     Released,
@@ -36,12 +44,58 @@ enum class PressureState {
     Heavy
 };
 
+enum class AudioMode {
+    TextToSpeech,
+    Clips
+};
+
+enum class PlaybackKind {
+    None,
+    TextToSpeech,
+    Clip
+};
+
+struct PlayerCommand {
+    QString program;
+    QStringList arguments;
+
+    bool isValid() const { return !program.isEmpty(); }
+};
+
 QString readText(const QString &path)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
         return {};
     return QString::fromUtf8(file.readAll()).trimmed();
+}
+
+QString executablePath(const QString &candidate)
+{
+    if (candidate.isEmpty())
+        return {};
+    const QFileInfo info(candidate);
+    if (info.isAbsolute() || candidate.contains(QLatin1Char('/'))
+        || candidate.contains(QLatin1Char('\\'))) {
+        return info.exists() && info.isFile() && info.isExecutable()
+            ? info.absoluteFilePath() : QString();
+    }
+    return QStandardPaths::findExecutable(candidate);
+}
+
+QString stateSpeech(PressureState state)
+{
+    switch (state) {
+    case PressureState::Light:
+        return QString::fromUtf8("轻按");
+    case PressureState::Medium:
+        return QString::fromUtf8("中等压力");
+    case PressureState::Heavy:
+        return QString::fromUtf8("压力较大");
+    case PressureState::Released:
+        return {};
+    }
+    return {};
 }
 
 QFrame *makePanel(QWidget *parent = nullptr)
@@ -57,7 +111,9 @@ public:
     explicit PressureChart(QWidget *parent = nullptr)
         : QWidget(parent)
     {
-        setMinimumHeight(390);
+        // The audio controls share the fixed 720x1280 screen with the chart.
+        // Keep enough room for the graph without forcing the bottom controls off-screen.
+        setMinimumHeight(320);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     }
 
@@ -132,17 +188,20 @@ public:
         setWindowTitle(QString::fromUtf8("压力监测"));
         setupUi();
         setupStyle();
-        setupSpeech();
+        reloadConfiguration(true);
+        setupAudio();
         inspectHardware();
         resetCalibration();
         connect(&m_sampleTimer, &QTimer::timeout, this, [this]() { sample(); });
         m_sampleTimer.start(kSampleIntervalMs);
+        connect(&m_configTimer, &QTimer::timeout,
+            this, [this]() { reloadConfiguration(false); });
+        m_configTimer.start(1000);
     }
 
     ~PressureWindow() override
     {
-        if (m_ttsProcess.state() != QProcess::NotRunning)
-            m_ttsProcess.kill();
+        stopPlayback();
     }
 
 protected:
@@ -153,6 +212,12 @@ protected:
             return;
         }
         QWidget::keyPressEvent(event);
+    }
+
+    void closeEvent(QCloseEvent *event) override
+    {
+        stopPlayback();
+        QWidget::closeEvent(event);
     }
 
 private:
@@ -210,6 +275,36 @@ private:
         valueLayout->addWidget(m_valueLabel);
         root->addWidget(valuePanel);
 
+        auto *audioPanel = makePanel(this);
+        auto *audioLayout = new QVBoxLayout(audioPanel);
+        audioLayout->setContentsMargins(16, 10, 16, 10);
+        audioLayout->setSpacing(7);
+        auto *audioButtons = new QHBoxLayout;
+        auto *audioTitle = new QLabel(QString::fromUtf8("声音反馈"), audioPanel);
+        audioTitle->setObjectName(QStringLiteral("sectionTitle"));
+        m_ttsButton = new QPushButton(QString::fromUtf8("声音反馈：关闭"), audioPanel);
+        m_ttsButton->setObjectName(QStringLiteral("ttsButton"));
+        m_ttsButton->setProperty("active", false);
+        connect(m_ttsButton, &QPushButton::clicked,
+            this, [this]() { setFeedbackEnabled(!m_feedbackEnabled, true); });
+        m_modeButton = new QPushButton(QString::fromUtf8("模式：语音合成"), audioPanel);
+        m_modeButton->setObjectName(QStringLiteral("modeButton"));
+        connect(m_modeButton, &QPushButton::clicked,
+            this, [this]() {
+                setAudioMode(m_audioMode == AudioMode::TextToSpeech
+                    ? AudioMode::Clips : AudioMode::TextToSpeech, true);
+            });
+        audioButtons->addWidget(audioTitle);
+        audioButtons->addStretch();
+        audioButtons->addWidget(m_ttsButton);
+        audioButtons->addWidget(m_modeButton);
+        audioLayout->addLayout(audioButtons);
+        m_audioStatusLabel = new QLabel(audioPanel);
+        m_audioStatusLabel->setObjectName(QStringLiteral("audioStatus"));
+        m_audioStatusLabel->setWordWrap(true);
+        audioLayout->addWidget(m_audioStatusLabel);
+        root->addWidget(audioPanel);
+
         auto *chartHeader = new QHBoxLayout;
         auto *chartTitle = new QLabel(QString::fromUtf8("相对力度曲线"), this);
         chartTitle->setObjectName(QStringLiteral("sectionTitle"));
@@ -217,14 +312,8 @@ private:
         resetButton->setObjectName(QStringLiteral("resetButton"));
         connect(resetButton, &QPushButton::clicked,
             this, [this]() { resetCalibration(); });
-        m_ttsButton = new QPushButton(QString::fromUtf8("语音播报：关闭"), this);
-        m_ttsButton->setObjectName(QStringLiteral("ttsButton"));
-        m_ttsButton->setProperty("active", false);
-        connect(m_ttsButton, &QPushButton::clicked,
-            this, [this]() { setSpeechEnabled(!m_speechEnabled); });
         chartHeader->addWidget(chartTitle);
         chartHeader->addStretch();
-        chartHeader->addWidget(m_ttsButton);
         chartHeader->addWidget(resetButton);
         root->addLayout(chartHeader);
 
@@ -284,6 +373,11 @@ private:
                 font-size: 21px;
                 color: #d8e2ef;
             }
+            QLabel#audioStatus {
+                min-height: 64px;
+                color: #cbd5e1;
+                font-size: 17px;
+            }
             QLabel#pressureValue {
                 font-size: 35px;
                 font-weight: 700;
@@ -341,7 +435,7 @@ private:
                 font-size: 19px;
             }
             QPushButton#exitButton, QPushButton#resetButton,
-            QPushButton#ttsButton {
+            QPushButton#ttsButton, QPushButton#modeButton {
                 min-width: 126px;
                 min-height: 58px;
                 border: 2px solid #40516a;
@@ -352,7 +446,12 @@ private:
                 font-weight: 700;
             }
             QPushButton#ttsButton {
-                min-width: 220px;
+                min-width: 190px;
+                background-color: #25334a;
+                border-color: #52647f;
+            }
+            QPushButton#modeButton {
+                min-width: 190px;
                 background-color: #25334a;
                 border-color: #52647f;
             }
@@ -398,95 +497,468 @@ private:
         return override.isEmpty() ? QStringLiteral("/usr/bin/espeak") : override;
     }
 
-    void setupSpeech()
+    QString configPath() const
     {
-        connect(&m_ttsProcess,
+        const QString override = qEnvironmentVariable("PRESSUREMONITOR_CONFIG_PATH");
+        return override.isEmpty()
+            ? QStringLiteral("/userdata/pressure_monitor/config.ini") : override;
+    }
+
+    QString resolvedAudioPath(const QString &configuredPath) const
+    {
+        if (configuredPath.isEmpty())
+            return {};
+        const QFileInfo info(configuredPath);
+        if (info.isAbsolute())
+            return info.absoluteFilePath();
+        return QDir(QFileInfo(configPath()).absolutePath())
+            .absoluteFilePath(configuredPath);
+    }
+
+    static bool parseBoolean(const QVariant &value, bool defaultValue, bool *valid)
+    {
+        const QString text = value.toString().trimmed().toLower();
+        if (text == QStringLiteral("true") || text == QStringLiteral("1")
+            || text == QStringLiteral("yes") || text == QStringLiteral("on")) {
+            *valid = true;
+            return true;
+        }
+        if (text == QStringLiteral("false") || text == QStringLiteral("0")
+            || text == QStringLiteral("no") || text == QStringLiteral("off")) {
+            *valid = true;
+            return false;
+        }
+        *valid = false;
+        return defaultValue;
+    }
+
+    void reloadConfiguration(bool force)
+    {
+        QFile file(configPath());
+        const bool exists = file.exists();
+        QByteArray contents;
+        if (exists && file.open(QIODevice::ReadOnly))
+            contents = file.readAll();
+        if (!force && exists == m_configFileExists && contents == m_configSnapshot) {
+            refreshAudioAvailability();
+            return;
+        }
+
+        const AudioMode oldMode = m_audioMode;
+        const bool oldEnabled = m_feedbackEnabled;
+        const QString oldLight = m_lightClipPath;
+        const QString oldMedium = m_mediumClipPath;
+        const QString oldHeavy = m_heavyClipPath;
+
+        m_configFileExists = exists;
+        m_configSnapshot = contents;
+        m_configIssue.clear();
+
+        QSettings settings(configPath(), QSettings::IniFormat);
+        settings.setIniCodec("UTF-8");
+        bool invalid = false;
+
+        const QString mode = settings.value(QStringLiteral("audio/mode"),
+            QStringLiteral("tts")).toString().trimmed().toLower();
+        if (mode == QStringLiteral("clips")) {
+            m_audioMode = AudioMode::Clips;
+        } else {
+            m_audioMode = AudioMode::TextToSpeech;
+            if (mode != QStringLiteral("tts"))
+                invalid = true;
+        }
+
+        bool boolOk = false;
+        m_feedbackEnabled = parseBoolean(settings.value(
+            QStringLiteral("audio/enabled"), false), false, &boolOk);
+        invalid = invalid || !boolOk;
+        m_fallbackTts = parseBoolean(settings.value(
+            QStringLiteral("audio/fallback_tts"), true), true, &boolOk);
+        invalid = invalid || !boolOk;
+
+        m_lightClipPath = resolvedAudioPath(settings.value(
+            QStringLiteral("audio/light"),
+            QStringLiteral("/userdata/pressure_monitor/audio/light.wav"))
+            .toString().trimmed());
+        m_mediumClipPath = resolvedAudioPath(settings.value(
+            QStringLiteral("audio/medium"),
+            QStringLiteral("/userdata/pressure_monitor/audio/medium.wav"))
+            .toString().trimmed());
+        m_heavyClipPath = resolvedAudioPath(settings.value(
+            QStringLiteral("audio/heavy"),
+            QStringLiteral("/userdata/pressure_monitor/audio/heavy.wav"))
+            .toString().trimmed());
+
+        bool volumeOk = false;
+        const int volume = settings.value(QStringLiteral("audio/volume_percent"),
+            100).toInt(&volumeOk);
+        m_volumePercent = volumeOk && volume >= 0 && volume <= 100 ? volume : 100;
+        invalid = invalid || !volumeOk || volume < 0 || volume > 100;
+
+        bool lightOk = false;
+        bool mediumOk = false;
+        bool heavyOk = false;
+        const int light = settings.value(QStringLiteral("pressure/light_threshold"),
+            kDefaultLightThreshold).toInt(&lightOk);
+        const int medium = settings.value(QStringLiteral("pressure/medium_threshold"),
+            kDefaultMediumThreshold).toInt(&mediumOk);
+        const int heavy = settings.value(QStringLiteral("pressure/heavy_threshold"),
+            kDefaultHeavyThreshold).toInt(&heavyOk);
+        if (lightOk && mediumOk && heavyOk && light > 0 && light < medium
+            && medium < heavy && heavy <= 100) {
+            m_lightThreshold = light;
+            m_mediumThreshold = medium;
+            m_heavyThreshold = heavy;
+        } else {
+            m_lightThreshold = kDefaultLightThreshold;
+            m_mediumThreshold = kDefaultMediumThreshold;
+            m_heavyThreshold = kDefaultHeavyThreshold;
+            invalid = true;
+        }
+
+        bool cooldownOk = false;
+        const int cooldown = settings.value(QStringLiteral("pressure/cooldown_ms"),
+            kDefaultVoiceCooldownMs).toInt(&cooldownOk);
+        m_voiceCooldownMs = cooldownOk && cooldown >= 0 && cooldown <= 60000
+            ? cooldown : kDefaultVoiceCooldownMs;
+        invalid = invalid || !cooldownOk || cooldown < 0 || cooldown > 60000;
+
+        if (settings.status() != QSettings::NoError) {
+            m_audioMode = AudioMode::TextToSpeech;
+            m_feedbackEnabled = false;
+            m_fallbackTts = true;
+            m_lightClipPath = QStringLiteral("/userdata/pressure_monitor/audio/light.wav");
+            m_mediumClipPath = QStringLiteral("/userdata/pressure_monitor/audio/medium.wav");
+            m_heavyClipPath = QStringLiteral("/userdata/pressure_monitor/audio/heavy.wav");
+            m_volumePercent = 100;
+            m_lightThreshold = kDefaultLightThreshold;
+            m_mediumThreshold = kDefaultMediumThreshold;
+            m_heavyThreshold = kDefaultHeavyThreshold;
+            m_voiceCooldownMs = kDefaultVoiceCooldownMs;
+        }
+        if (settings.status() == QSettings::FormatError) {
+            m_configIssue = QString::fromUtf8("格式错误，已使用安全默认值");
+        } else if (settings.status() == QSettings::AccessError) {
+            m_configIssue = QString::fromUtf8("读取失败，已使用安全默认值");
+        } else if (invalid) {
+            m_configIssue = QString::fromUtf8("部分配置无效，已使用默认值");
+        } else if (!exists) {
+            m_configIssue = QString::fromUtf8("文件未创建，当前使用默认值");
+        }
+
+        const bool playbackConfigChanged = m_configLoaded
+            && (oldMode != m_audioMode || oldEnabled != m_feedbackEnabled
+                || oldLight != m_lightClipPath || oldMedium != m_mediumClipPath
+                || oldHeavy != m_heavyClipPath);
+        if (playbackConfigChanged)
+            stopPlayback();
+        if (m_configLoaded && (oldMode != m_audioMode || oldEnabled != m_feedbackEnabled))
+            resetFeedbackState();
+        m_configLoaded = true;
+
+        refreshPrograms();
+        refreshAudioAvailability();
+    }
+
+    bool persistSetting(const QString &key, const QVariant &value)
+    {
+        const QFileInfo configInfo(configPath());
+        if (!QDir().mkpath(configInfo.absolutePath())) {
+            m_configIssue = QString::fromUtf8("无法创建配置目录");
+            updateAudioUi();
+            return false;
+        }
+        QSettings settings(configPath(), QSettings::IniFormat);
+        settings.setIniCodec("UTF-8");
+        settings.setValue(key, value);
+        settings.sync();
+        if (settings.status() != QSettings::NoError) {
+            m_configIssue = QString::fromUtf8("配置保存失败");
+            updateAudioUi();
+            return false;
+        }
+        reloadConfiguration(true);
+        return true;
+    }
+
+    void setupAudio()
+    {
+        connect(&m_playbackProcess,
             QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int, QProcess::ExitStatus) {
-                if (!m_pendingEnableAnnouncement || !m_speechEnabled)
+            this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                const PlaybackKind finishedKind = m_playbackKind;
+                const QString fallbackText = m_currentFallbackText;
+                m_playbackKind = PlaybackKind::None;
+                m_currentFallbackText.clear();
+                if (finishedKind == PlaybackKind::Clip
+                    && (exitStatus != QProcess::NormalExit || exitCode != 0)
+                    && m_fallbackTts && !fallbackText.isEmpty()) {
+                    scheduleTtsFallback(fallbackText);
+                    return;
+                }
+                if (!m_pendingEnableAnnouncement || !m_feedbackEnabled)
                     return;
                 m_pendingEnableAnnouncement = false;
-                speak(QString::fromUtf8("语音播报已开启"), true);
+                startTts(QString::fromUtf8("语音播报已开启"), true);
             });
-        connect(&m_ttsProcess, &QProcess::errorOccurred,
+        connect(&m_playbackProcess, &QProcess::errorOccurred,
             this, [this](QProcess::ProcessError error) {
                 if (error != QProcess::FailedToStart)
                     return;
-                m_pendingEnableAnnouncement = false;
-                m_speechEnabled = false;
-                m_speechAvailable = false;
-                updateSpeechButton();
-                showSpeechUnavailable(QString::fromUtf8(
-                    "语音程序启动失败：%1").arg(speechProgram()));
+                const PlaybackKind failedKind = m_playbackKind;
+                const QString failedProgram = m_playbackProcess.program();
+                const QString fallbackText = m_currentFallbackText;
+                m_playbackKind = PlaybackKind::None;
+                m_currentFallbackText.clear();
+                if (failedKind == PlaybackKind::TextToSpeech) {
+                    m_failedTtsProgram = failedProgram;
+                    QTimer::singleShot(5000, this, [this, failedProgram]() {
+                        if (m_failedTtsProgram != failedProgram)
+                            return;
+                        m_failedTtsProgram.clear();
+                        refreshAudioAvailability();
+                    });
+                } else if (failedKind == PlaybackKind::Clip) {
+                    m_failedPlayerProgram = failedProgram;
+                    QTimer::singleShot(5000, this, [this, failedProgram]() {
+                        if (m_failedPlayerProgram != failedProgram)
+                            return;
+                        m_failedPlayerProgram.clear();
+                        refreshAudioAvailability();
+                    });
+                }
+                refreshPrograms();
+                refreshAudioAvailability();
+                if (failedKind == PlaybackKind::Clip && m_fallbackTts
+                    && !fallbackText.isEmpty()) {
+                    scheduleTtsFallback(fallbackText);
+                } else {
+                    m_pendingEnableAnnouncement = false;
+                }
             });
 
-        const QFileInfo program(speechProgram());
-        m_speechAvailable = program.exists() && program.isFile()
-            && program.isExecutable();
-        if (!m_speechAvailable) {
-            showSpeechUnavailable(QString::fromUtf8(
-                "未找到可执行的语音程序：%1").arg(speechProgram()));
+        m_playbackProcess.setStandardOutputFile(QProcess::nullDevice());
+        m_playbackProcess.setStandardErrorFile(QProcess::nullDevice());
+        refreshPrograms();
+        refreshAudioAvailability();
+
+        bool autoEnableOk = false;
+        const int autoEnable = qEnvironmentVariableIntValue(
+            "PRESSUREMONITOR_AUTO_ENABLE_SOUND", &autoEnableOk);
+        if (autoEnableOk && autoEnable != 0 && !m_feedbackEnabled) {
+            m_feedbackEnabled = true;
+            updateAudioUi();
         }
-        updateSpeechButton();
     }
 
-    void showSpeechUnavailable(const QString &message)
+    void refreshPrograms()
     {
-        if (!m_ttsButton)
-            return;
-        m_ttsButton->setToolTip(message);
-        m_ttsButton->setAccessibleDescription(message);
-        qWarning("%s", qPrintable(message));
+        const QString tts = executablePath(speechProgram());
+        m_ttsProgram = tts == m_failedTtsProgram ? QString() : tts;
+
+        const QString override = qEnvironmentVariable("PRESSUREMONITOR_AUDIO_PLAYER");
+        if (!override.isEmpty()) {
+            const QString player = executablePath(override);
+            m_playerOverrideProgram = player == m_failedPlayerProgram
+                ? QString() : player;
+            m_ffplayProgram.clear();
+            m_aplayProgram.clear();
+        } else {
+            m_playerOverrideProgram.clear();
+            const QString ffplay = executablePath(QStringLiteral("/usr/bin/ffplay"));
+            const QString aplay = executablePath(QStringLiteral("/usr/bin/aplay"));
+            m_ffplayProgram = ffplay == m_failedPlayerProgram ? QString() : ffplay;
+            m_aplayProgram = aplay == m_failedPlayerProgram ? QString() : aplay;
+        }
     }
 
-    void updateSpeechButton()
+    PlayerCommand playerCommand(const QString &path) const
     {
-        if (!m_ttsButton)
+        const bool wav = QFileInfo(path).suffix().compare(
+            QStringLiteral("wav"), Qt::CaseInsensitive) == 0;
+        QString program;
+        bool useAplay = false;
+        if (!qEnvironmentVariable("PRESSUREMONITOR_AUDIO_PLAYER").isEmpty()) {
+            program = m_playerOverrideProgram;
+            useAplay = QFileInfo(program).fileName().contains(
+                QStringLiteral("aplay"), Qt::CaseInsensitive);
+            if (useAplay && !wav)
+                return {};
+        } else if (!m_ffplayProgram.isEmpty()) {
+            program = m_ffplayProgram;
+        } else if (wav && !m_aplayProgram.isEmpty()) {
+            program = m_aplayProgram;
+            useAplay = true;
+        }
+        if (program.isEmpty())
+            return {};
+        if (useAplay)
+            return { program, { QStringLiteral("-q"), path } };
+        return { program, {
+            QStringLiteral("-nodisp"), QStringLiteral("-autoexit"),
+            QStringLiteral("-loglevel"), QStringLiteral("quiet"),
+            QStringLiteral("-volume"), QString::number(m_volumePercent),
+            QStringLiteral("-i"), path
+        } };
+    }
+
+    QString clipPath(PressureState state) const
+    {
+        switch (state) {
+        case PressureState::Light:
+            return m_lightClipPath;
+        case PressureState::Medium:
+            return m_mediumClipPath;
+        case PressureState::Heavy:
+            return m_heavyClipPath;
+        case PressureState::Released:
+            return {};
+        }
+        return {};
+    }
+
+    bool isClipAvailable(PressureState state) const
+    {
+        const QString path = clipPath(state);
+        const QFileInfo file(path);
+        return !path.isEmpty() && file.exists() && file.isFile()
+            && file.isReadable() && playerCommand(path).isValid();
+    }
+
+    void refreshAudioAvailability()
+    {
+        refreshPrograms();
+        m_speechAvailable = !m_ttsProgram.isEmpty();
+        m_lightClipAvailable = isClipAvailable(PressureState::Light);
+        m_mediumClipAvailable = isClipAvailable(PressureState::Medium);
+        m_heavyClipAvailable = isClipAvailable(PressureState::Heavy);
+        updateAudioUi();
+    }
+
+    bool feedbackAvailable() const
+    {
+        if (m_audioMode == AudioMode::TextToSpeech)
+            return m_speechAvailable;
+        return m_lightClipAvailable || m_mediumClipAvailable || m_heavyClipAvailable
+            || (m_fallbackTts && m_speechAvailable);
+    }
+
+    void updateAudioUi()
+    {
+        if (!m_ttsButton || !m_modeButton || !m_audioStatusLabel)
             return;
-        m_ttsButton->setEnabled(m_speechAvailable);
-        m_ttsButton->setText(m_speechAvailable
-            ? (m_speechEnabled ? QString::fromUtf8("语音播报：开启")
-                               : QString::fromUtf8("语音播报：关闭"))
-            : QString::fromUtf8("语音播报：不可用"));
-        m_ttsButton->setProperty("active", m_speechEnabled);
+        m_ttsButton->setEnabled(m_feedbackEnabled || feedbackAvailable());
+        m_ttsButton->setText(m_feedbackEnabled
+            ? QString::fromUtf8("声音反馈：开启")
+            : (feedbackAvailable() ? QString::fromUtf8("声音反馈：关闭")
+                                   : QString::fromUtf8("声音反馈：不可用")));
+        m_ttsButton->setProperty("active", m_feedbackEnabled);
         m_ttsButton->style()->unpolish(m_ttsButton);
         m_ttsButton->style()->polish(m_ttsButton);
         m_ttsButton->update();
+
+        m_modeButton->setText(m_audioMode == AudioMode::Clips
+            ? QString::fromUtf8("模式：音频片段")
+            : QString::fromUtf8("模式：语音合成"));
+
+        QString playerName = QString::fromUtf8("不可用");
+        if (!m_playerOverrideProgram.isEmpty())
+            playerName = QFileInfo(m_playerOverrideProgram).fileName();
+        else if (!m_ffplayProgram.isEmpty())
+            playerName = QStringLiteral("ffplay");
+        else if (!m_aplayProgram.isEmpty())
+            playerName = QStringLiteral("aplay（仅 WAV）");
+        const QString configState = m_configIssue.isEmpty()
+            ? QString::fromUtf8("已加载") : m_configIssue;
+        m_audioStatusLabel->setText(QString::fromUtf8(
+            "素材：轻按 %1 · 中等 %2 · 重按 %3　TTS %4 · 播放器 %5\n"
+            "配置：%6（%7）")
+            .arg(m_lightClipAvailable ? QString::fromUtf8("可用") : QString::fromUtf8("缺失"))
+            .arg(m_mediumClipAvailable ? QString::fromUtf8("可用") : QString::fromUtf8("缺失"))
+            .arg(m_heavyClipAvailable ? QString::fromUtf8("可用") : QString::fromUtf8("缺失"))
+            .arg(m_speechAvailable ? QString::fromUtf8("可用") : QString::fromUtf8("不可用"))
+            .arg(playerName, configPath(), configState));
+        m_audioStatusLabel->setToolTip(QString::fromUtf8(
+            "轻按：%1\n中等：%2\n重按：%3")
+            .arg(m_lightClipPath, m_mediumClipPath, m_heavyClipPath));
     }
 
-    void setSpeechEnabled(bool enabled)
+    void resetFeedbackState()
     {
-        if (enabled && !m_speechAvailable)
-            return;
-
-        m_speechEnabled = enabled;
+        m_voiceCandidateState = PressureState::Released;
         m_voiceCandidateCount = 0;
-        m_lastSpokenState = PressureState::Released;
+        m_lastFeedbackState = PressureState::Released;
         m_pendingEnableAnnouncement = false;
-        updateSpeechButton();
+    }
+
+    void setAudioMode(AudioMode mode, bool persist)
+    {
+        if (mode == m_audioMode)
+            return;
+        stopPlayback();
+        if (persist) {
+            if (!persistSetting(QStringLiteral("audio/mode"),
+                    mode == AudioMode::Clips ? QStringLiteral("clips")
+                                             : QStringLiteral("tts"))) {
+                m_audioMode = mode;
+            }
+        } else {
+            m_audioMode = mode;
+        }
+        resetFeedbackState();
+        refreshAudioAvailability();
+    }
+
+    void setFeedbackEnabled(bool enabled, bool persist)
+    {
+        if (enabled && !feedbackAvailable())
+            return;
+        stopPlayback();
+        if (persist) {
+            if (!persistSetting(QStringLiteral("audio/enabled"), enabled))
+                m_feedbackEnabled = enabled;
+        } else {
+            m_feedbackEnabled = enabled;
+        }
+        resetFeedbackState();
+        updateAudioUi();
 
         if (!enabled) {
-            if (m_ttsProcess.state() != QProcess::NotRunning)
-                m_ttsProcess.kill();
             return;
         }
 
-        if (!speak(QString::fromUtf8("语音播报已开启"), true))
+        if (m_audioMode == AudioMode::TextToSpeech && m_speechAvailable
+            && !startTts(QString::fromUtf8("语音播报已开启"), true)) {
             m_pendingEnableAnnouncement = true;
+        }
     }
 
-    bool speak(const QString &text, bool ignoreCooldown = false)
+    void stopPlayback()
     {
-        if (!m_speechEnabled || !m_speechAvailable
-            || m_ttsProcess.state() != QProcess::NotRunning) {
-            return false;
-        }
-        if (!ignoreCooldown && m_lastSpeechTimer.isValid()
-            && m_lastSpeechTimer.elapsed() < kVoiceCooldownMs) {
+        m_pendingEnableAnnouncement = false;
+        m_currentFallbackText.clear();
+        m_playbackKind = PlaybackKind::None;
+        if (m_playbackProcess.state() != QProcess::NotRunning)
+            m_playbackProcess.kill();
+    }
+
+    bool cooldownReady(bool ignoreCooldown) const
+    {
+        return ignoreCooldown || !m_lastSpeechTimer.isValid()
+            || m_lastSpeechTimer.elapsed() >= m_voiceCooldownMs;
+    }
+
+    bool startTts(const QString &text, bool ignoreCooldown = false)
+    {
+        if (!m_feedbackEnabled || !m_speechAvailable
+            || m_playbackProcess.state() != QProcess::NotRunning
+            || !cooldownReady(ignoreCooldown)) {
             return false;
         }
 
-        m_ttsProcess.start(speechProgram(), {
+        m_playbackKind = PlaybackKind::TextToSpeech;
+        m_currentFallbackText.clear();
+        m_playbackProcess.start(m_ttsProgram, {
             QStringLiteral("-v"), QStringLiteral("zh"),
             QStringLiteral("-s"), QStringLiteral("145"), text
         });
@@ -494,7 +966,50 @@ private:
         return true;
     }
 
-    void handleSpeechSample(PressureState state)
+    bool startClip(PressureState state, const QString &fallbackText)
+    {
+        const QString path = clipPath(state);
+        const PlayerCommand command = playerCommand(path);
+        if (!m_feedbackEnabled || !command.isValid()
+            || !QFileInfo(path).isReadable()
+            || m_playbackProcess.state() != QProcess::NotRunning
+            || !cooldownReady(false)) {
+            return false;
+        }
+
+        m_playbackKind = PlaybackKind::Clip;
+        m_currentFallbackText = fallbackText;
+        m_playbackProcess.start(command.program, command.arguments);
+        m_lastSpeechTimer.restart();
+        return true;
+    }
+
+    void scheduleTtsFallback(const QString &text)
+    {
+        if (!m_feedbackEnabled || !m_fallbackTts || !m_speechAvailable)
+            return;
+        QTimer::singleShot(0, this, [this, text]() {
+            if (m_feedbackEnabled && m_audioMode == AudioMode::Clips
+                && m_fallbackTts && m_speechAvailable) {
+                startTts(text, true);
+            }
+        });
+    }
+
+    bool playStateFeedback(PressureState state)
+    {
+        const QString text = stateSpeech(state);
+        if (text.isEmpty())
+            return false;
+        if (m_audioMode == AudioMode::Clips) {
+            if (isClipAvailable(state))
+                return startClip(state, text);
+            return m_fallbackTts && startTts(text);
+        }
+        return startTts(text);
+    }
+
+    void handleFeedbackSample(PressureState state)
     {
         if (state != m_voiceCandidateState) {
             m_voiceCandidateState = state;
@@ -507,28 +1022,14 @@ private:
             return;
 
         if (state == PressureState::Released) {
-            m_lastSpokenState = PressureState::Released;
+            m_lastFeedbackState = PressureState::Released;
             return;
         }
-        if (!m_speechEnabled || state == m_lastSpokenState)
+        if (!m_feedbackEnabled || state == m_lastFeedbackState)
             return;
 
-        QString text;
-        switch (state) {
-        case PressureState::Light:
-            text = QString::fromUtf8("轻按");
-            break;
-        case PressureState::Medium:
-            text = QString::fromUtf8("中等压力");
-            break;
-        case PressureState::Heavy:
-            text = QString::fromUtf8("压力较大");
-            break;
-        case PressureState::Released:
-            return;
-        }
-        if (speak(text))
-            m_lastSpokenState = state;
+        if (playStateFeedback(state))
+            m_lastFeedbackState = state;
     }
 
     void inspectHardware()
@@ -611,7 +1112,7 @@ private:
         m_percentLabel->setText(QString::fromUtf8("相对力度 %1%")
             .arg(relative, 0, 'f', 1));
         const PressureState pressureState = updatePressureState(relative);
-        handleSpeechSample(pressureState);
+        handleFeedbackSample(pressureState);
 
         m_history.append(relative);
         if (m_history.size() > kHistorySamples)
@@ -633,15 +1134,15 @@ private:
 
     PressureState updatePressureState(double relative)
     {
-        if (relative < 3.0) {
+        if (relative < m_lightThreshold) {
             setState(QString::fromUtf8("○ 松开"), QStringLiteral("released"));
             return PressureState::Released;
         }
-        if (relative < 25.0) {
+        if (relative < m_mediumThreshold) {
             setState(QString::fromUtf8("● 轻按"), QStringLiteral("light"));
             return PressureState::Light;
         }
-        if (relative < 60.0) {
+        if (relative < m_heavyThreshold) {
             setState(QString::fromUtf8("● 中等"), QStringLiteral("medium"));
             return PressureState::Medium;
         }
@@ -671,7 +1172,7 @@ private:
         m_history.clear();
         m_voiceCandidateState = PressureState::Released;
         m_voiceCandidateCount = 0;
-        m_lastSpokenState = PressureState::Released;
+        m_lastFeedbackState = PressureState::Released;
         if (m_chart)
             m_chart->setValues(m_history);
         if (m_baselineLabel)
@@ -688,28 +1189,56 @@ private:
     QLabel *m_valueLabel = nullptr;
     QLabel *m_baselineLabel = nullptr;
     QLabel *m_errorLabel = nullptr;
+    QLabel *m_audioStatusLabel = nullptr;
     QPushButton *m_ttsButton = nullptr;
+    QPushButton *m_modeButton = nullptr;
     PressureChart *m_chart = nullptr;
     QTimer m_sampleTimer;
-    QProcess m_ttsProcess;
+    QTimer m_configTimer;
+    QProcess m_playbackProcess;
     QElapsedTimer m_lastSpeechTimer;
     QVector<double> m_history;
     QVector<int> m_filterWindow;
+    QByteArray m_configSnapshot;
+    QString m_configIssue;
+    QString m_lightClipPath;
+    QString m_mediumClipPath;
+    QString m_heavyClipPath;
+    QString m_ttsProgram;
+    QString m_playerOverrideProgram;
+    QString m_ffplayProgram;
+    QString m_aplayProgram;
+    QString m_failedTtsProgram;
+    QString m_failedPlayerProgram;
+    QString m_currentFallbackText;
     qint64 m_calibrationSum = 0;
     int m_calibrationCount = 0;
     int m_baseline = 0;
     int m_currentRaw = 0;
+    int m_volumePercent = 100;
+    int m_lightThreshold = kDefaultLightThreshold;
+    int m_mediumThreshold = kDefaultMediumThreshold;
+    int m_heavyThreshold = kDefaultHeavyThreshold;
+    int m_voiceCooldownMs = kDefaultVoiceCooldownMs;
     double m_filtered = 0.0;
     double m_scaleMillivolts = 0.0;
     bool m_hardwareReady = false;
     bool m_scaleReady = false;
     bool m_calibrated = false;
     bool m_filterReady = false;
+    bool m_configFileExists = false;
+    bool m_configLoaded = false;
     bool m_speechAvailable = false;
-    bool m_speechEnabled = false;
+    bool m_feedbackEnabled = false;
+    bool m_fallbackTts = true;
+    bool m_lightClipAvailable = false;
+    bool m_mediumClipAvailable = false;
+    bool m_heavyClipAvailable = false;
     bool m_pendingEnableAnnouncement = false;
+    AudioMode m_audioMode = AudioMode::TextToSpeech;
+    PlaybackKind m_playbackKind = PlaybackKind::None;
     PressureState m_voiceCandidateState = PressureState::Released;
-    PressureState m_lastSpokenState = PressureState::Released;
+    PressureState m_lastFeedbackState = PressureState::Released;
     int m_voiceCandidateCount = 0;
 };
 

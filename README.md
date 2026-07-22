@@ -37,7 +37,7 @@
 - I2C、UART、CAN、PWM、SPI 只读诊断和板载按键计数；
 - 一键检查 7 类硬件状态，并把结果保存到 `/userdata/rv1126b_lab/reports/`。
 
-源代码、构建、安装和安全测试方法见 [apps/rv1126b_lab/README.md](apps/rv1126b_lab/README.md)。原来的 [ADC 调速灯](apps/adc_led_touch/README.md) 仍保留为单功能入门原型。
+源代码、构建、安装和安全测试方法见 [apps/rv1126b_lab/README.md](apps/rv1126b_lab/README.md)。原来的 [ADC 调速灯](apps/adc_led_touch/README.md) 仍保留为单功能入门原型；外接 FSR 后可使用独立的 [N1 压力监测与声音反馈应用](apps/pressure_monitor/README.md)。
 
 ## 现在先做什么
 

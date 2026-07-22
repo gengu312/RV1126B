@@ -1,0 +1,14 @@
+[audio]
+enabled=false
+mode=tts
+fallback_tts=true
+light=/userdata/pressure_monitor/audio/light.wav
+medium=/userdata/pressure_monitor/audio/medium.wav
+heavy=/userdata/pressure_monitor/audio/heavy.wav
+volume_percent=100
+
+[pressure]
+light_threshold=3
+medium_threshold=25
+heavy_threshold=60
+cooldown_ms=2000
